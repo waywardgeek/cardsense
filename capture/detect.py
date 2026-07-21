@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-detect.py — screen capture loop that finds zoomed MTG cards using static
-image edge detection (OpenCV), looks them up via pHash, and speaks the result.
+cardsense detector — event-driven zoomed-card detection + pHash matching.
 
-Detection strategy (Static Image):
-- Convert frame to grayscale, apply Canny edge detection.
-- Find contours and their bounding boxes.
-- Filter by size (~200-280px wide, ~300-450px tall) and aspect ratio (0.52-0.82).
-- Sort left-to-right to handle multiple cards naturally.
-- TTS Interruption: If a new card is detected, instantly kill the old speech.
+Algorithm (see ../design.md):
+  Stage A: cheap per-frame motion gate. Downsampled grayscale frame diff.
+           A zoom animation produces motion; we wait for it to settle.
+  Stage B: region proposal. Diff the settled frame against the pre-motion
+           background frame, threshold, connected components. Card-shaped
+           blobs (portrait aspect ~0.71, height 25-90% of frame) survive.
+  Stage C: refine. Tight bbox of diff pixels at full resolution snaps the
+           crop to the actual card border, independent of display scale.
+  Stage D: match. Vectorized 256-bit pHash Hamming scan over all ~53K cards
+           (numpy XOR + popcount table, ~ms). Accept only on confident
+           match: best <= MAX_DIST and margin to the best *other-named*
+           card >= MIN_MARGIN. Otherwise: silence (never guess).
 
-Run modes:
-    python3 detect.py --loop          # continuous loop with TTS (main mode)
-    python3 detect.py --loop --debug  # also saves crops to /tmp
+Usage:
+  python3 detect.py --loop              # live screen watching
+  python3 detect.py --test shot.png     # offline: run stages B-D on an image
+                                        # (diffed against a black background)
+  python3 detect.py --test shot.png --bg empty_board.png
 """
-
 import argparse
 import os
 import sqlite3
@@ -22,205 +28,270 @@ import subprocess
 import sys
 import time
 
-import cv2
-import mss
 import numpy as np
 from PIL import Image
 
-HASHINDEX_DIR = os.path.join(os.path.dirname(__file__), "..", "hashindex")
-DB_PATH = os.path.join(HASHINDEX_DIR, "data", "index.sqlite")
+# --- Configuration ---
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "hashindex", "data", "index.sqlite")
 
-# --- Tunable constants ---
-MIN_CARD_W   = 160   # minimum card width in actual pixels
-MIN_CARD_H   = 250   # minimum card height in actual pixels
-MAX_CARD_W   = 380   # upper bound (bigger = it's a tooltip or screen transition)
-MAX_CARD_H   = 520
-ASPECT_MIN   = 0.52  # width/height
-ASPECT_MAX   = 0.82
-COOLDOWN     = 2.0   # don't re-announce same exact set of cards this soon
-MAX_DIST     = 20    # max pHash Hamming distance to accept a match (256-bit)
+# Geometry (all relative to frame height -> display-scale independent)
+MIN_CARD_FRAC = 0.25    # zoomed card is at least 25% of frame height
+MAX_CARD_FRAC = 0.92
+ASPECT_MIN, ASPECT_MAX = 0.60, 0.85   # real card ratio ~0.716
 
-# Global tracker for the TTS process so we can interrupt it
+# Motion gate
+DOWNSAMPLE = 8          # stage-A works on 1/8 resolution grayscale
+MOTION_THRESH = 6.0     # mean abs diff (0-255) above this = motion
+SETTLE_FRAMES = 2       # quiet frames required after motion before we look
+DIFF_PIX_THRESH = 25    # per-pixel diff threshold for the region mask
+
+# Matching
+MAX_DIST = 60           # of 256 bits; correct matches historically 0-16
+MIN_MARGIN = 25         # best other-named card must be this much worse
+INSETS = (-0.04, -0.02, 0.0, 0.02, 0.04)  # fractional crop adjustments
+                                          # (negative = expand beyond box)
+
+SPEECH_RATE = 350
+COOLDOWN = 5.0
+FRAME_INTERVAL = 0.20
+
+POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(1).astype(np.uint16)
+
 current_say_proc = None
 
 
-def load_index(db_path):
-    if not os.path.exists(db_path):
-        print(f"[cardsense] WARNING: no index at {db_path} — run build_index.py first")
-        return []
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("""SELECT scryfall_id, name, mana_cost, type_line,
-                          oracle_text, power, toughness, phash FROM cards""")
-    rows = cur.fetchall()
-    conn.close()
-    print(f"[cardsense] {len(rows)} cards in index")
-    return rows
-
-
-def hamming(a: str, b: str) -> int:
-    return bin(int(a, 16) ^ int(b, 16)).count("1")
-
-
-def match_card(img: Image.Image, rows):
-    import imagehash
-    q = str(imagehash.phash(img, hash_size=16))
-    best_dist, best_row = 9999, None
-    for row in rows:
-        d = hamming(q, row[7])
-        if d < best_dist:
-            best_dist, best_row = d, row
-    return best_dist, best_row
-
-
-def card_speech(row):
-    _, name, mana_cost, type_line, oracle_text, power, toughness, _ = row
-    parts = [name]
-    if mana_cost:
-        cost = mana_cost.replace("{", "").replace("}", " ").strip()
-        parts.append(cost)
-    if type_line:
-        parts.append(type_line)
-    if oracle_text:
-        parts.append(oracle_text.strip())
-    if power and toughness:
-        parts.append(f"{power} slash {toughness}")
-    return ". ".join(parts)
-
-
-def speak(text: str):
+def speak(text, interrupt=True):
     global current_say_proc
-    # Interrupt previous speech if it's still running
-    if current_say_proc is not None and current_say_proc.poll() is None:
+    if interrupt and current_say_proc and current_say_proc.poll() is None:
         current_say_proc.kill()
-    
-    current_say_proc = subprocess.Popen(["say", "-r", "260", text])
+    current_say_proc = subprocess.Popen(["say", "-r", str(SPEECH_RATE), text])
 
 
-def grab_frame(sct) -> np.ndarray:
-    raw = sct.grab(sct.monitors[1])
-    img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-    return np.array(img)
+# ---------------- index loading / matching (Stage D) ----------------
 
+class CardIndex:
+    def __init__(self, db_path):
+        if not os.path.exists(db_path):
+            raise SystemExit(f"[cardsense] ERROR: index not found at {db_path}")
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT scryfall_id, name, mana_cost, type_line, oracle_text,"
+            " power, toughness, phash FROM cards WHERE phash IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        self.meta = [r[:7] for r in rows]
+        # 64 hex chars = 256 bits = 32 bytes per card
+        self.hashes = np.frombuffer(
+            bytes.fromhex("".join(r[7] for r in rows)), dtype=np.uint8
+        ).reshape(len(rows), 32)
+        print(f"[cardsense] loaded {len(rows)} card hashes")
 
-def find_card_regions_static(frame: np.ndarray, debug=False):
-    """
-    Find portrait-shaped card-sized regions using OpenCV edge detection.
-    Returns list of (x, y, w, h) sorted left-to-right.
-    """
-    # Convert to grayscale
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    
-    # Canny edge detection
-    edges = cv2.Canny(gray, 50, 150)
-    
-    # Dilate edges slightly to close gaps in card borders
-    kernel = np.ones((5, 5), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
-    
-    # Find contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    candidates = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        
-        if w < MIN_CARD_W or h < MIN_CARD_H:
-            continue
-        if w > MAX_CARD_W or h > MAX_CARD_H:
-            continue
-            
-        aspect = w / float(h)
-        if not (ASPECT_MIN <= aspect <= ASPECT_MAX):
-            continue
-            
-        candidates.append((x, y, w, h))
-        
-    # Sort left-to-right
-    candidates.sort(key=lambda r: r[0])
-    
-    # Deduplicate overlapping bounding boxes (sometimes contours nest)
-    deduped = []
-    for c in candidates:
-        x, y, w, h = c
-        overlap = False
-        for dx, dy, dw, dh in deduped:
-            # Simple intersection check
-            if not (x + w < dx or dx + dw < x or y + h < dy or dy + dh < y):
-                overlap = True
+    def query(self, img):
+        """Return (best_dist, meta, margin_to_other_name). Vectorized scan."""
+        import imagehash
+        q = np.packbits(imagehash.phash(img, hash_size=16).hash.flatten())
+        dists = POPCOUNT[np.bitwise_xor(self.hashes, q[None, :])].sum(axis=1)
+        order = np.argsort(dists)
+        best = order[0]
+        best_name = self.meta[best][1]
+        margin = 256
+        for j in order[1:200]:
+            if self.meta[j][1] != best_name:
+                margin = int(dists[j]) - int(dists[best])
                 break
-        if not overlap:
-            deduped.append(c)
-            
-    return deduped
+        return int(dists[best]), self.meta[best], margin
+
+    def match_crop(self, frame_rgb, box):
+        """Try crops at several insets/outsets around box; most confident wins.
+        Outsets recover card borders that blend into the background and get
+        clipped by the diff-based tight bbox."""
+        x, y, w, h = box
+        H, W = frame_rgb.shape[:2]
+        best = (999, None, 0)
+        for adj in INSETS:
+            dx, dy = int(w * adj), int(h * adj)
+            x0, y0 = max(0, x + dx), max(0, y + dy)
+            x1, y1 = min(W, x + w - dx), min(H, y + h - dy)
+            if x1 - x0 < 50 or y1 - y0 < 50:
+                continue
+            sub = Image.fromarray(frame_rgb[y0:y1, x0:x1])
+            d, meta, margin = self.query(sub)
+            if d < best[0]:
+                best = (d, meta, margin)
+        return best
 
 
-def crop_region(frame: np.ndarray, x, y, w, h) -> Image.Image:
-    inset = 6
-    return Image.fromarray(
-        frame[max(0,y+inset):min(frame.shape[0],y+h-inset),
-              max(0,x+inset):min(frame.shape[1],x+w-inset)]
-    )
+# ---------------- region proposal (Stages B & C) ----------------
+
+def find_card_regions(frame_rgb, background_rgb):
+    """Diff settled frame against background (max abs channel diff — catches
+    dark card borders on dark felt that a grayscale diff misses); return list
+    of (x, y, w, h) full-resolution card-shaped boxes."""
+    from scipy import ndimage
+
+    H = frame_rgb.shape[0]
+    diff = np.abs(frame_rgb.astype(np.int16)
+                  - background_rgb.astype(np.int16)).max(axis=2)
+    mask = ndimage.binary_closing(diff > DIFF_PIX_THRESH,
+                                  structure=np.ones((7, 7), bool))
+
+    # Label on a downsampled mask so nearby noise doesn't merge and it's cheap.
+    small = mask[::DOWNSAMPLE, ::DOWNSAMPLE]
+    labels, n = ndimage.label(small)
+    if n == 0:
+        return []
+
+    regions = []
+    for sl in ndimage.find_objects(labels):
+        y0, y1 = sl[0].start * DOWNSAMPLE, sl[0].stop * DOWNSAMPLE
+        x0, x1 = sl[1].start * DOWNSAMPLE, sl[1].stop * DOWNSAMPLE
+        h, w = y1 - y0, x1 - x0
+        if not (MIN_CARD_FRAC * H <= h <= MAX_CARD_FRAC * H):
+            continue
+
+        # Stage C: snap to tight bbox of diff pixels at full resolution.
+        pad = DOWNSAMPLE * 2
+        ys = max(0, y0 - pad); ye = min(mask.shape[0], y1 + pad)
+        xs = max(0, x0 - pad); xe = min(mask.shape[1], x1 + pad)
+        sub = mask[ys:ye, xs:xe]
+        rows = np.where(sub.any(axis=1))[0]
+        cols = np.where(sub.any(axis=0))[0]
+        if len(rows) == 0 or len(cols) == 0:
+            continue
+        fy0, fy1 = ys + rows[0], ys + rows[-1] + 1
+        fx0, fx1 = xs + cols[0], xs + cols[-1] + 1
+        fh, fw = fy1 - fy0, fx1 - fx0
+        if fh == 0 or not (ASPECT_MIN <= fw / fh <= ASPECT_MAX):
+            continue
+        if not (MIN_CARD_FRAC * H <= fh <= MAX_CARD_FRAC * H):
+            continue
+        # Solidity: the diff blob should mostly fill its bbox (cards are solid)
+        fill = mask[fy0:fy1, fx0:fx1].mean()
+        if fill < 0.70:
+            continue
+        regions.append((fx0, fy0, fw, fh))
+
+    return sorted(regions, key=lambda r: r[0])  # left-to-right
 
 
-def run_loop(debug=False):
-    index = load_index(DB_PATH)
-    if not index:
-        print("[cardsense] no index — run hashindex/build_index.py first")
-        sys.exit(1)
+def to_gray(frame_rgb):
+    return (0.299 * frame_rgb[:, :, 0] + 0.587 * frame_rgb[:, :, 1]
+            + 0.114 * frame_rgb[:, :, 2]).astype(np.uint8)
 
-    print("[cardsense] watching screen... Ctrl-C to stop")
-    last_spoken_ids = set()
+
+# ---------------- main loops ----------------
+
+def announce(matches):
+    parts = []
+    for dist, meta, margin in matches:
+        name, mana, type_line, oracle = meta[1], meta[2], meta[3], meta[4]
+        pt = f" {meta[5]}/{meta[6]}." if meta[5] else ""
+        parts.append(f"{name}. {type_line}.{pt} {oracle}")
+    speak(" ... ".join(parts))
+
+
+def process_frame(frame_rgb, background_rgb, index, verbose=True):
+    """Stages B-D on one settled frame. Returns list of confident matches."""
+    regions = find_card_regions(frame_rgb, background_rgb)
+    confident = []
+    for (x, y, w, h) in regions:
+        dist, meta, margin = index.match_crop(frame_rgb, (x, y, w, h))
+        if verbose:
+            status = "MATCH" if (dist <= MAX_DIST and margin >= MIN_MARGIN) else "reject"
+            print(f"  region ({x},{y},{w}x{h}) -> {meta[1]!r} dist={dist} margin={margin} [{status}]")
+        if dist <= MAX_DIST and margin >= MIN_MARGIN:
+            confident.append((dist, meta, margin))
+    return confident
+
+
+def run_loop():
+    import mss
+    index = CardIndex(DB_PATH)
+    speak("Card sense active")
+
+    last_spoken_ids = frozenset()
     last_spoken_time = 0.0
+    last_heartbeat = 0.0
 
-    with mss.MSS() as sct:
+    prev_small = None
+    background_rgb = None    # last known quiet frame BEFORE motion started
+    pending_bg = None        # candidate background, promoted when quiet
+    motion_active = False
+    quiet_count = 0
+
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
         while True:
-            frame = grab_frame(sct)
-            regions = find_card_regions_static(frame, debug)
+            now = time.time()
+            if now - last_heartbeat > 10:
+                print(f"[cardsense] {time.strftime('%H:%M:%S')} scanning...")
+                last_heartbeat = now
 
-            if regions:
-                current_ids = []
-                speech_parts = []
-                
-                for i, (x, y, w, h) in enumerate(regions):
-                    crop = crop_region(frame, x, y, w, h)
-                    dist, row = match_card(crop, index)
-                    
-                    if dist <= MAX_DIST:
-                        card_id = row[0]
-                        current_ids.append(card_id)
-                        speech_parts.append(card_speech(row))
-                        
-                        if debug:
-                            crop.save(f"/tmp/cs_{row[1].replace(' ','_')}_{i}.png")
-                    else:
-                        if debug:
-                            crop.save(f"/tmp/cs_unmatched_{int(time.time())}_{i}.png")
-                
-                current_ids_set = frozenset(current_ids)
-                
-                # If we found valid cards, and they are DIFFERENT from what we just spoke
-                # OR enough time has passed (cooldown), speak them.
-                if current_ids and (current_ids_set != last_spoken_ids or time.time() - last_spoken_time > COOLDOWN):
-                    combined_speech = " ... ".join(speech_parts)
-                    names = [p.split('.')[0] for p in speech_parts]
-                    print(f"[cardsense] Detected: {', '.join(names)}")
-                    
-                    speak(combined_speech)
-                    
-                    last_spoken_ids = current_ids_set
-                    last_spoken_time = time.time()
+            raw = sct.grab(monitor)
+            frame = np.array(Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX"))
+            gray = to_gray(frame)
+            small = gray[::DOWNSAMPLE, ::DOWNSAMPLE].astype(np.int16)
 
-            time.sleep(0.10)   # ~10fps
+            if prev_small is None:
+                prev_small = small
+                background_rgb = frame
+                time.sleep(FRAME_INTERVAL)
+                continue
+
+            motion = float(np.abs(small - prev_small).mean())
+            prev_small = small
+
+            if motion > MOTION_THRESH:
+                if not motion_active:
+                    motion_active = True
+                    # background = the quiet frame we were holding
+                    if pending_bg is not None:
+                        background_rgb = pending_bg
+                quiet_count = 0
+            else:
+                quiet_count += 1
+                if motion_active and quiet_count >= SETTLE_FRAMES:
+                    # Motion just settled: look for newly-appeared cards.
+                    motion_active = False
+                    matches = process_frame(frame, background_rgb, index)
+                    ids = frozenset(m[1][0] for m in matches)
+                    if matches and (ids != last_spoken_ids
+                                    or now - last_spoken_time > COOLDOWN):
+                        print(f"[cardsense] >>> speaking: "
+                              f"{', '.join(m[1][1] for m in matches)}")
+                        announce(matches)
+                        last_spoken_ids = ids
+                        last_spoken_time = now
+                elif not motion_active and quiet_count >= SETTLE_FRAMES:
+                    pending_bg = frame  # a stable frame; future background
+
+            time.sleep(FRAME_INTERVAL)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="cardsense — MTGA card reader")
-    ap.add_argument("--loop",  action="store_true", help="run capture loop (default)")
-    ap.add_argument("--debug", action="store_true", help="save card crops to /tmp")
-    args = ap.parse_args()
-    run_loop(debug=args.debug)
+def run_test(image_path, bg_path=None):
+    index = CardIndex(DB_PATH)
+    frame = np.array(Image.open(image_path).convert("RGB"))
+    if bg_path:
+        bg = np.array(Image.open(bg_path).convert("RGB"))
+    else:
+        bg = np.zeros_like(frame)
+        print("[cardsense] no --bg given: diffing against black "
+              "(region proposal will be generous)")
+    matches = process_frame(frame, bg, index)
+    for dist, meta, margin in matches:
+        print(f"MATCH: {meta[1]} (dist={dist}, margin={margin})")
+        print(f"  {meta[3]} | {meta[4][:120]}")
+    if not matches:
+        print("No confident matches.")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--loop", action="store_true", help="live screen watching")
+    ap.add_argument("--test", metavar="IMG", help="run detection on an image file")
+    ap.add_argument("--bg", metavar="IMG", help="background image for --test")
+    args = ap.parse_args()
+    if args.test:
+        run_test(args.test, args.bg)
+    else:
+        run_loop()
