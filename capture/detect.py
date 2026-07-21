@@ -45,11 +45,12 @@ MOTION_THRESH = 6.0     # mean abs diff (0-255) above this = motion
 SETTLE_FRAMES = 2       # quiet frames required after motion before we look
 DIFF_PIX_THRESH = 25    # per-pixel diff threshold for the region mask
 
-# Matching
-MAX_DIST = 60           # of 256 bits; correct matches historically 0-16
-MIN_MARGIN = 25         # best other-named card must be this much worse
-INSETS = (-0.04, -0.02, 0.0, 0.02, 0.04)  # fractional crop adjustments
-                                          # (negative = expand beyond box)
+# Matching. Calibrated on real MTGA captures 2026-07-21: correct card ~48-58
+# bits, nearest wrong card ~72+. (Scryfall-vs-Scryfall harness gives 0-16.)
+MAX_DIST = 65           # of 256 bits
+MIN_MARGIN = 12         # best other-named card must be this much worse
+ALIGN_SHIFTS = (-8, 0, 8)     # px shift sweep around proposed box
+ALIGN_SCALES = (-8, -4, 0, 4, 8)  # px grow/shrink sweep
 
 SPEECH_RATE = 350
 COOLDOWN = 5.0
@@ -102,22 +103,24 @@ class CardIndex:
         return int(dists[best]), self.meta[best], margin
 
     def match_crop(self, frame_rgb, box):
-        """Try crops at several insets/outsets around box; most confident wins.
-        Outsets recover card borders that blend into the background and get
-        clipped by the diff-based tight bbox."""
+        """Local alignment sweep (shift + scale in pixels) around the proposed
+        box; most confident result wins. pHash is very alignment-sensitive:
+        a few px of offset costs ~10-40 bits, so the sweep is what separates
+        the true card from the noise floor."""
         x, y, w, h = box
         H, W = frame_rgb.shape[:2]
         best = (999, None, 0)
-        for adj in INSETS:
-            dx, dy = int(w * adj), int(h * adj)
-            x0, y0 = max(0, x + dx), max(0, y + dy)
-            x1, y1 = min(W, x + w - dx), min(H, y + h - dy)
-            if x1 - x0 < 50 or y1 - y0 < 50:
-                continue
-            sub = Image.fromarray(frame_rgb[y0:y1, x0:x1])
-            d, meta, margin = self.query(sub)
-            if d < best[0]:
-                best = (d, meta, margin)
+        for dx in ALIGN_SHIFTS:
+            for dy in ALIGN_SHIFTS:
+                for ds in ALIGN_SCALES:
+                    x0, y0 = max(0, x + dx - ds), max(0, y + dy - ds)
+                    x1, y1 = min(W, x + w + dx + ds), min(H, y + h + dy + ds)
+                    if x1 - x0 < 50 or y1 - y0 < 50:
+                        continue
+                    sub = Image.fromarray(frame_rgb[y0:y1, x0:x1])
+                    d, meta, margin = self.query(sub)
+                    if d < best[0]:
+                        best = (d, meta, margin)
         return best
 
 
@@ -190,12 +193,19 @@ def announce(matches):
     speak(" ... ".join(parts))
 
 
-def process_frame(frame_rgb, background_rgb, index, verbose=True):
+DEBUG_DIR = "/tmp/cardsense_debug"
+
+def process_frame(frame_rgb, background_rgb, index, verbose=True, debug=False):
     """Stages B-D on one settled frame. Returns list of confident matches."""
     regions = find_card_regions(frame_rgb, background_rgb)
     confident = []
-    for (x, y, w, h) in regions:
+    for i, (x, y, w, h) in enumerate(regions):
         dist, meta, margin = index.match_crop(frame_rgb, (x, y, w, h))
+        if debug:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            ts = time.strftime("%H%M%S")
+            Image.fromarray(frame_rgb[y:y+h, x:x+w]).save(
+                f"{DEBUG_DIR}/{ts}_r{i}_d{dist}_{meta[1][:20].replace(' ','_').replace('/','_')}.png")
         if verbose:
             status = "MATCH" if (dist <= MAX_DIST and margin >= MIN_MARGIN) else "reject"
             print(f"  region ({x},{y},{w}x{h}) -> {meta[1]!r} dist={dist} margin={margin} [{status}]")
@@ -204,7 +214,7 @@ def process_frame(frame_rgb, background_rgb, index, verbose=True):
     return confident
 
 
-def run_loop():
+def run_loop(debug=False):
     import mss
     index = CardIndex(DB_PATH)
     speak("Card sense active")
@@ -240,6 +250,8 @@ def run_loop():
 
             motion = float(np.abs(small - prev_small).mean())
             prev_small = small
+            if debug:
+                print(f"    motion={motion:.2f} active={motion_active} quiet={quiet_count}")
 
             if motion > MOTION_THRESH:
                 if not motion_active:
@@ -253,7 +265,7 @@ def run_loop():
                 if motion_active and quiet_count >= SETTLE_FRAMES:
                     # Motion just settled: look for newly-appeared cards.
                     motion_active = False
-                    matches = process_frame(frame, background_rgb, index)
+                    matches = process_frame(frame, background_rgb, index, debug=debug)
                     ids = frozenset(m[1][0] for m in matches)
                     if matches and (ids != last_spoken_ids
                                     or now - last_spoken_time > COOLDOWN):
@@ -290,8 +302,9 @@ if __name__ == "__main__":
     ap.add_argument("--loop", action="store_true", help="live screen watching")
     ap.add_argument("--test", metavar="IMG", help="run detection on an image file")
     ap.add_argument("--bg", metavar="IMG", help="background image for --test")
+    ap.add_argument("--debug", action="store_true", help="save crops to /tmp/cardsense_debug")
     args = ap.parse_args()
     if args.test:
         run_test(args.test, args.bg)
     else:
-        run_loop()
+        run_loop(debug=args.debug)
