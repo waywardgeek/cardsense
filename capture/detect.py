@@ -126,7 +126,45 @@ class CardIndex:
 
 # ---------------- region proposal (Stages B & C) ----------------
 
-def find_card_regions(frame_rgb, background_rgb):
+def split_blob(mask, bbox, H, debug=False):
+    """A hovered card often merges with its keyword-tooltip panel into one
+    wide blob. Split by column occupancy: card columns are nearly full blob
+    height, tooltip columns are shorter. Returns candidate (x, y, w, h)."""
+    x0, y0, x1, y1 = bbox
+    sub = mask[y0:y1, x0:x1]
+    col_occ = sub.sum(axis=0)          # mask pixels per column
+    if col_occ.max() == 0:
+        return []
+    tall = col_occ >= 0.75 * col_occ.max()
+    # contiguous runs of tall columns
+    runs, start = [], None
+    for i, t in enumerate(tall):
+        if t and start is None:
+            start = i
+        elif not t and start is not None:
+            runs.append((start, i)); start = None
+    if start is not None:
+        runs.append((start, len(tall)))
+    out = []
+    for rs, re in runs:
+        if re - rs < 40:
+            continue
+        seg = sub[:, rs:re]
+        rows = np.where(seg.any(axis=1))[0]
+        if len(rows) == 0:
+            continue
+        ry0, ry1 = rows[0], rows[-1] + 1
+        w, h = re - rs, ry1 - ry0
+        if debug:
+            print(f"      split ({x0+rs},{y0+ry0}) {w}x{h} aspect={w/max(1,h):.2f}")
+        if (ASPECT_MIN <= w / h <= ASPECT_MAX
+                and MIN_CARD_FRAC * H <= h <= MAX_CARD_FRAC * H
+                and seg[ry0:ry1].mean() >= 0.70):
+            out.append((x0 + rs, y0 + ry0, w, h))
+    return out
+
+
+def find_card_regions(frame_rgb, background_rgb, debug=False):
     """Diff settled frame against background (max abs channel diff — catches
     dark card borders on dark felt that a grayscale diff misses); return list
     of (x, y, w, h) full-resolution card-shaped boxes."""
@@ -149,6 +187,8 @@ def find_card_regions(frame_rgb, background_rgb):
         y0, y1 = sl[0].start * DOWNSAMPLE, sl[0].stop * DOWNSAMPLE
         x0, x1 = sl[1].start * DOWNSAMPLE, sl[1].stop * DOWNSAMPLE
         h, w = y1 - y0, x1 - x0
+        if debug and h >= 0.10 * H:
+            print(f"    blob ({x0},{y0}) {w}x{h} aspect={w/h:.2f} hfrac={h/H:.2f}")
         if not (MIN_CARD_FRAC * H <= h <= MAX_CARD_FRAC * H):
             continue
 
@@ -164,7 +204,15 @@ def find_card_regions(frame_rgb, background_rgb):
         fy0, fy1 = ys + rows[0], ys + rows[-1] + 1
         fx0, fx1 = xs + cols[0], xs + cols[-1] + 1
         fh, fw = fy1 - fy0, fx1 - fx0
-        if fh == 0 or not (ASPECT_MIN <= fw / fh <= ASPECT_MAX):
+        if debug:
+            fill_dbg = mask[fy0:fy1, fx0:fx1].mean()
+            print(f"      snap ({fx0},{fy0}) {fw}x{fh} aspect={fw/max(1,fh):.2f} fill={fill_dbg:.2f}")
+        if fh == 0:
+            continue
+        if not (ASPECT_MIN <= fw / fh <= ASPECT_MAX):
+            if fw / max(1, fh) > ASPECT_MAX:
+                # too wide: likely card merged with tooltip panel — split it
+                regions.extend(split_blob(mask, (fx0, fy0, fx1, fy1), H, debug=debug))
             continue
         if not (MIN_CARD_FRAC * H <= fh <= MAX_CARD_FRAC * H):
             continue
@@ -193,11 +241,40 @@ def announce(matches):
     speak(" ... ".join(parts))
 
 
+def grid_scan(frame_rgb, index, bbox=None, debug=False):
+    """Fallback when diff-based proposal fails (whole-screen transitions):
+    slide card-aspect windows over the area and let pHash matching find the
+    card. The confidence margin rejects non-card windows. Coarse grid first,
+    then alignment-sweep refinement of the best cell."""
+    H, W = frame_rgb.shape[:2]
+    x0, y0, x1, y1 = bbox if bbox else (0, 0, W, H)
+    best = (999, None, 0, None)
+    for frac in (0.42, 0.55, 0.70):
+        ch = int(frac * H)
+        cw = int(0.716 * ch)
+        stride = max(24, ch // 6)
+        for yy in range(y0, max(y0 + 1, y1 - ch + 1), stride):
+            for xx in range(x0, max(x0 + 1, x1 - cw + 1), stride):
+                sub = Image.fromarray(frame_rgb[yy:yy + ch, xx:xx + cw])
+                d, meta, margin = index.query(sub)
+                if d < best[0]:
+                    best = (d, meta, margin, (xx, yy, cw, ch))
+    if best[3] is None or best[0] > MAX_DIST + 15:
+        return []
+    # refine winner with the alignment sweep
+    d, meta, margin = index.match_crop(frame_rgb, best[3])
+    if debug:
+        print(f"    grid-scan best {best[3]} -> {meta[1]!r} dist={d} margin={margin}")
+    if d <= MAX_DIST and margin >= MIN_MARGIN:
+        return [(d, meta, margin)]
+    return []
+
+
 DEBUG_DIR = "/tmp/cardsense_debug"
 
 def process_frame(frame_rgb, background_rgb, index, verbose=True, debug=False):
     """Stages B-D on one settled frame. Returns list of confident matches."""
-    regions = find_card_regions(frame_rgb, background_rgb)
+    regions = find_card_regions(frame_rgb, background_rgb, debug=debug)
     confident = []
     for i, (x, y, w, h) in enumerate(regions):
         dist, meta, margin = index.match_crop(frame_rgb, (x, y, w, h))
@@ -211,6 +288,12 @@ def process_frame(frame_rgb, background_rgb, index, verbose=True, debug=False):
             print(f"  region ({x},{y},{w}x{h}) -> {meta[1]!r} dist={dist} margin={margin} [{status}]")
         if dist <= MAX_DIST and margin >= MIN_MARGIN:
             confident.append((dist, meta, margin))
+    if not confident:
+        # NOTE: no grid-scan fallback here. Tried 2026-07-21: pHash needs
+        # <10px alignment, so a coarse grid both misses the true card and
+        # nearly latches wrong ones (dist=80 vs threshold 65+15). Silence
+        # is correct when the diff can't isolate a card-shaped region.
+        pass
     return confident
 
 
@@ -289,7 +372,7 @@ def run_test(image_path, bg_path=None):
         bg = np.zeros_like(frame)
         print("[cardsense] no --bg given: diffing against black "
               "(region proposal will be generous)")
-    matches = process_frame(frame, bg, index)
+    matches = process_frame(frame, bg, index, debug=True)
     for dist, meta, margin in matches:
         print(f"MATCH: {meta[1]} (dist={dist}, margin={margin})")
         print(f"  {meta[3]} | {meta[4][:120]}")
