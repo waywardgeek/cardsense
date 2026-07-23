@@ -27,6 +27,8 @@ scale), which removes localization misses and tightens the match threshold.
 """
 import argparse
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -41,17 +43,29 @@ from phash import CardIndex  # noqa: E402
 ASPECT_MIN, ASPECT_MAX = 0.58, 0.88     # real card ratio ~0.716
 PRESENT_HF = 0.35                        # presented card >= 35% of frame height
                                          # (measured: presented ~0.44-0.48, hand ~0.21)
-# --- Speech ---
-SPEECH_RATE = 200                        # spd-say -r (words/min-ish)
+# --- Speech (cross-platform) ---
+SAY_RATE_WPM = 220        # macOS `say -r` words/min
+SPD_RATE = 10             # Linux `spd-say -r` (-100..100)
 _say_proc = None
 
 
-def speak(text, rate=SPEECH_RATE, interrupt=True):
-    """Speak via spd-say (Linux speech-dispatcher)."""
+def speak(text, interrupt=True):
+    """Speak `text` using the platform TTS: macOS `say`, else Linux `spd-say`,
+    else `espeak-ng`. interrupt=True cancels the previous utterance so a new
+    card preempts a still-speaking old one."""
     global _say_proc
     if interrupt and _say_proc and _say_proc.poll() is None:
         _say_proc.terminate()
-    _say_proc = subprocess.Popen(["spd-say", "-r", str(rate), text])
+    if platform.system() == "Darwin":
+        cmd = ["say", "-r", str(SAY_RATE_WPM), text]
+    elif shutil.which("spd-say"):
+        cmd = ["spd-say", "-r", str(SPD_RATE), text]
+    elif shutil.which("espeak-ng"):
+        cmd = ["espeak-ng", text]
+    else:
+        print(f"[no TTS available] {text}")
+        return
+    _say_proc = subprocess.Popen(cmd)
 
 
 def find_presented(frame_bgr):
