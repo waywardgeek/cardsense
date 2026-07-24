@@ -14,24 +14,32 @@ import json
 import os
 import sys
 import time
-from urllib.request import urlopen, urlretrieve
-from urllib.error import HTTPError
 
 import numpy as np
 import cv2
+import requests
 
 from phash import dual_phash, DATA_DIR
 
 
-BULK_ENDPOINT = "https://api.scryfall.com/bulk-data/default-cards"
+BULK_LIST_ENDPOINT = "https://api.scryfall.com/bulk-data"
 METADATA_FILE = os.path.join(DATA_DIR, "scryfall_metadata.json")
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 cardsense/1.0"
 
 
 def fetch_bulk_metadata():
-    """Fetch the bulk data endpoint to get download URL and updated_at timestamp."""
-    print("Fetching Scryfall bulk metadata...", flush=True)
-    with urlopen(BULK_ENDPOINT) as resp:
-        return json.loads(resp.read())
+    """Fetch the bulk data list and find the 'default_cards' entry."""
+    print("Fetching Scryfall bulk data list...", flush=True)
+    resp = requests.get(BULK_LIST_ENDPOINT, headers={"User-Agent": USER_AGENT})
+    resp.raise_for_status()
+    bulk_list = resp.json()
+    
+    # Find the default_cards entry
+    for entry in bulk_list.get("data", []):
+        if entry.get("type") == "default_cards":
+            return entry
+    
+    raise RuntimeError("Could not find 'default_cards' in Scryfall bulk data list")
 
 
 def needs_update(force=False):
@@ -100,8 +108,11 @@ def download_and_hash(cards, verbose=True):
         # Download image to temp file
         temp_path = os.path.join(temp_dir, f"{card_id}.jpg")
         try:
-            urlretrieve(img_url, temp_path)
-        except (HTTPError, Exception) as e:
+            resp = requests.get(img_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            resp.raise_for_status()
+            with open(temp_path, 'wb') as f:
+                f.write(resp.content)
+        except Exception as e:
             n_download_fail += 1
             if verbose and n_download_fail <= 5:
                 print(f"    Download failed for {card.get('name')}: {e}", flush=True)
@@ -169,8 +180,9 @@ def update_index(force=False):
     print(f"  Size: {bulk_meta.get('size', 0) / (1024*1024):.1f} MB", flush=True)
     
     # Download bulk JSON
-    with urlopen(download_url) as resp:
-        cards = json.loads(resp.read())
+    resp = requests.get(download_url, headers={"User-Agent": USER_AGENT})
+    resp.raise_for_status()
+    cards = resp.json()
     
     print(f"Loaded {len(cards)} card records", flush=True)
     
