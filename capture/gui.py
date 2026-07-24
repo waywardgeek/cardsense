@@ -189,80 +189,150 @@ class Detector:
             self.idx = CardIndex()
             self._set_status(f"Index loaded: {len(self.idx)} cards")
 
+        # Initial card box guess (fractions of screen) — left-side right-click zoom
+        # Measured from screenshot: x 1-24%, y 4-69%
+        BOX_FRAC = (0.01, 0.04, 0.23, 0.65)  # (x_frac, y_frac, w_frac, h_frac)
+
+        # Motion gate thresholds
+        MOTION_THRESH = 15.0      # mean pixel diff to detect "something changed"
+        QUIET_THRESH = 3.0        # mean pixel diff to detect "screen settled"
+        QUIET_FRAMES_NEEDED = 3   # consecutive quiet frames before we analyze
+        NO_CARD_FRAMES = 5        # frames with no match before resetting
+
         last_name = None
-        last_bbox = None   # sticky location: (x, y, w, h) of last successful match
-        fps_time = time.monotonic()
-        fps_count = 0
-
-        from collections import deque
-        RING_SIZE = 10
-        ring = deque(maxlen=RING_SIZE)  # only card-free frames go in here
-
-        no_card_count = 0
-        NO_CARD_FRAMES = 5
+        prev_frame = None
+        card_box = None           # locked (x, y, w, h) in pixels after twiddle
+        calibrated = False
 
         with mss.MSS() as sct:
             mon = sct.monitors[1]
+            H, W = mon["height"], mon["width"]
+
+            # Convert fractional box to pixel box (initial guess)
+            bx = int(BOX_FRAC[0] * W)
+            by = int(BOX_FRAC[1] * H)
+            bw = int(BOX_FRAC[2] * W)
+            bh = int(BOX_FRAC[3] * H)
+            card_box = (bx, by, bw, bh)
+
+            state = "idle"        # idle -> motion -> settling -> identify
+            quiet_count = 0
+            no_card_count = 0
+
             self._set_status("Watching... right-click a card")
             while self.running:
-                tg0 = time.monotonic()
                 shot = np.array(sct.grab(mon))[:, :, :3]
-                fps_count += 1
-                now_fps = time.monotonic()
-                if now_fps - fps_time >= 1.0:
-                    self.fps = fps_count / (now_fps - fps_time)
-                    fps_count = 0
-                    fps_time = now_fps
-                    if last_name is None:
-                        self._set_status(f"Watching... ({self.fps:.1f} fps)")
+                gray = cv2.cvtColor(
+                    cv2.resize(shot, (W // 4, H // 4)),
+                    cv2.COLOR_BGR2GRAY
+                )
 
-                background = ring[0] if len(ring) == RING_SIZE else None
-                candidates = find_all_candidates(shot, background)
+                if prev_frame is not None:
+                    diff_mean = np.mean(cv2.absdiff(gray, prev_frame))
+                else:
+                    diff_mean = 0.0
+                prev_frame = gray
 
-                best_hit = None
-                for (x, y, w, h) in candidates:
+                if state == "idle":
+                    if diff_mean > MOTION_THRESH:
+                        state = "motion"
+                        quiet_count = 0
+                        print(f"[GATE] motion detected diff={diff_mean:.1f}", flush=True)
+
+                elif state == "motion":
+                    if diff_mean < QUIET_THRESH:
+                        quiet_count += 1
+                        if quiet_count >= QUIET_FRAMES_NEEDED:
+                            state = "identify"
+                    else:
+                        quiet_count = 0
+
+                elif state == "identify":
+                    x, y, w, h = card_box
                     crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                     hit = self.idx.identify(crop)
+
                     if hit:
                         meta, dist, margin = hit
-                        if best_hit is None or margin > best_hit[0][2]:
-                            best_hit = (hit, (x, y, w, h))
+                        name = meta["name"]
 
-                # Sticky location: if diff didn't find the card, try the
-                # last known location directly (bypasses frame-diff entirely)
-                if best_hit is None and last_bbox is not None:
-                    sx, sy, sw, sh = last_bbox
-                    H, W = shot.shape[:2]
-                    if sy + sh <= H and sx + sw <= W:
-                        crop = cv2.cvtColor(shot[sy:sy+sh, sx:sx+sw], cv2.COLOR_BGR2GRAY)
-                        hit = self.idx.identify(crop)
-                        if hit:
-                            best_hit = (hit, last_bbox)
+                        # Twiddle to refine the box if not yet calibrated
+                        if not calibrated:
+                            card_box, dist, margin = self._twiddle(
+                                shot, card_box, self.idx
+                            )
+                            calibrated = True
+                            # Re-identify with refined box
+                            x, y, w, h = card_box
+                            crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+                            hit2 = self.idx.identify(crop)
+                            if hit2:
+                                meta, dist, margin = hit2
+                                name = meta["name"]
 
-                if best_hit is not None:
-                    no_card_count = 0
-                    (meta, dist, margin), bbox = best_hit
-                    last_bbox = bbox
-                    name = meta["name"]
-                    if name != last_name:
-                        last_name = name
-                        t_end = time.monotonic()
-                        sticky = " (sticky)" if not candidates else ""
-                        print(f"[DETECT] {name} d={dist} m={margin} t={t_end-tg0:.3f}s cands={len(candidates)}{sticky}", flush=True)
-                        self._set_status(f"🃏 {name}  (d={dist} m={margin}) {self.fps:.1f}fps")
-                        # Cancel any in-progress speech and speak new card
-                        self.speaker.speak(describe(meta))
-                    # Card present — do NOT add to ring (keep background card-free)
-                else:
-                    no_card_count += 1
-                    if no_card_count >= NO_CARD_FRAMES and last_name is not None:
-                        last_name = None
-                        last_bbox = None
-                        self._set_status(f"Watching... ({self.fps:.1f} fps)")
-                    # No card visible — safe to update background ring
-                    ring.append(shot.copy())
+                        if name != last_name:
+                            last_name = name
+                            no_card_count = 0
+                            print(f"[DETECT] {name} d={dist} m={margin} box={card_box} cal={calibrated}", flush=True)
+                            self._set_status(f"🃏 {name}  (d={dist} m={margin})")
+                            self.speaker.speak(describe(meta))
+                    else:
+                        no_card_count += 1
+                        if no_card_count >= NO_CARD_FRAMES and last_name is not None:
+                            last_name = None
+                            self._set_status("Watching...")
+
+                    state = "idle"
 
         self._set_status("Stopped")
+
+    @staticmethod
+    def _twiddle(shot, box, idx):
+        """Refine the crop box to minimize pHash distance.
+
+        Nudge x, y, w, h by a percentage, keep if distance improves or
+        stays equal. Run at 1% steps first, then 0.1% for fine tuning.
+        """
+        x, y, w, h = box
+        H_max, W_max = shot.shape[:2]
+
+        def score(bx, by, bw, bh):
+            bx, by, bw, bh = int(bx), int(by), int(bw), int(bh)
+            if bx < 0 or by < 0 or bw < 20 or bh < 20:
+                return 9999
+            if bx + bw > W_max or by + bh > H_max:
+                return 9999
+            crop = cv2.cvtColor(shot[by:by+bh, bx:bx+bw], cv2.COLOR_BGR2GRAY)
+            hit = idx.identify(crop, max_dist=9999, min_margin=0)
+            if hit is None:
+                return 9999
+            return hit[1]  # distance
+
+        best_score = score(x, y, w, h)
+        print(f"[TWIDDLE] start box=({x},{y},{w},{h}) dist={best_score}", flush=True)
+
+        for pct in (0.01, 0.001):
+            improved = True
+            while improved:
+                improved = False
+                for dim in range(4):  # x, y, w, h
+                    for sign in (+1, -1):
+                        trial = [x, y, w, h]
+                        step = max(1, int(trial[dim] * pct))
+                        trial[dim] += sign * step
+                        s = score(*trial)
+                        if s <= best_score:
+                            x, y, w, h = trial
+                            best_score = s
+                            improved = True
+
+        print(f"[TWIDDLE] done  box=({x},{y},{w},{h}) dist={best_score}", flush=True)
+
+        # Get margin for the final box
+        crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+        hit = idx.identify(crop, max_dist=9999, min_margin=0)
+        margin = hit[2] if hit else 0
+        return (x, y, w, h), best_score, margin
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────
