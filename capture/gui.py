@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hashindex"))
-from phash import CardIndex  # noqa: E402
+from phash import CardIndex, DATA_DIR  # noqa: E402
 
 # Import update_index for auto-update check
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -26,6 +26,80 @@ try:
     HAS_UPDATER = True
 except ImportError:
     HAS_UPDATER = False
+
+# ── Calibration persistence ────────────────────────────────────────────────
+CALIBRATION_FILE = os.path.join(DATA_DIR, "calibration.json")
+
+# Reference box for 1920×1080 (Bill's current setup, post-twiddle)
+# This is the hard-coded default, scaled for other resolutions
+REF_SCREEN = (1920, 1080)
+REF_BOX = (19, 43, 441, 702)  # (x, y, w, h) at 1920×1080
+
+
+def load_calibration(screen_w, screen_h):
+    """Load saved calibration box, scaled to current screen resolution.
+    
+    Returns (x, y, w, h, calibrated) where calibrated=True if loaded from file.
+    Falls back to REF_BOX scaled to current screen if no saved calibration.
+    """
+    import json
+    
+    # Try to load saved calibration
+    if os.path.exists(CALIBRATION_FILE):
+        try:
+            with open(CALIBRATION_FILE) as f:
+                data = json.load(f)
+            
+            saved_w, saved_h = data["screen_w"], data["screen_h"]
+            saved_box = tuple(data["box"])  # (x, y, w, h)
+            
+            # Scale to current screen if resolution differs
+            if (screen_w, screen_h) == (saved_w, saved_h):
+                print(f"[CALIBRATION] Loaded saved box: {saved_box} (same resolution)", flush=True)
+                return saved_box + (True,)
+            else:
+                scale_x = screen_w / saved_w
+                scale_y = screen_h / saved_h
+                scaled_box = (
+                    int(saved_box[0] * scale_x),
+                    int(saved_box[1] * scale_y),
+                    int(saved_box[2] * scale_x),
+                    int(saved_box[3] * scale_y)
+                )
+                print(f"[CALIBRATION] Loaded + scaled: {saved_w}×{saved_h} → {screen_w}×{screen_h}, box={scaled_box}", flush=True)
+                return scaled_box + (True,)
+        except Exception as e:
+            print(f"[CALIBRATION] Load failed: {e}, using default", flush=True)
+    
+    # Fall back to reference box, scaled to current screen
+    ref_w, ref_h = REF_SCREEN
+    scale_x = screen_w / ref_w
+    scale_y = screen_h / ref_h
+    scaled_box = (
+        int(REF_BOX[0] * scale_x),
+        int(REF_BOX[1] * scale_y),
+        int(REF_BOX[2] * scale_x),
+        int(REF_BOX[3] * scale_y)
+    )
+    print(f"[CALIBRATION] Using default (scaled to {screen_w}×{screen_h}): {scaled_box}", flush=True)
+    return scaled_box + (False,)
+
+
+def save_calibration(screen_w, screen_h, box):
+    """Save calibrated box for future sessions."""
+    import json
+    
+    data = {
+        "screen_w": screen_w,
+        "screen_h": screen_h,
+        "box": list(box)  # (x, y, w, h)
+    }
+    
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CALIBRATION_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"[CALIBRATION] Saved box={box} for {screen_w}×{screen_h}", flush=True)
 
 # ── Localization (frame-diff) ──────────────────────────────────────────────
 ASPECT_MIN, ASPECT_MAX = 0.50, 0.95   # widened to catch hover + right-click zoom
@@ -235,8 +309,6 @@ class Detector:
             self.idx = CardIndex()
             self._set_status(f"Index loaded: {len(self.idx)} cards")
 
-        # Initial card box guess (fractions of screen) — left-side right-click zoom
-        BOX_FRAC = (0.01, 0.04, 0.23, 0.65)  # (x_frac, y_frac, w_frac, h_frac)
         NO_CARD_FRAMES = 10
 
         last_name = None
@@ -248,12 +320,10 @@ class Detector:
             mon = sct.monitors[1]
             H, W = mon["height"], mon["width"]
 
-            bx = int(BOX_FRAC[0] * W)
-            by = int(BOX_FRAC[1] * H)
-            bw = int(BOX_FRAC[2] * W)
-            bh = int(BOX_FRAC[3] * H)
-            card_box = (bx, by, bw, bh)
-            print(f"[INIT] screen={W}x{H} box=({bx},{by},{bw},{bh})", flush=True)
+            # Load calibration (saved or default, auto-scaled to current screen)
+            x, y, w, h, calibrated = load_calibration(W, H)
+            card_box = (x, y, w, h)
+            print(f"[INIT] screen={W}×{H} box=({x},{y},{w},{h}) calibrated={calibrated}", flush=True)
 
             self._set_status("Watching... right-click a card")
             self.speaker.speak("CardSense ready")
@@ -288,6 +358,10 @@ class Detector:
 
                         card_box, dist, margin = self._twiddle(shot, card_box, self.idx)
                         calibrated = True
+                        
+                        # Save calibration for future sessions
+                        save_calibration(W, H, card_box)
+                        
                         x, y, w, h = card_box
                         crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                         hit2 = self.idx.identify(crop)
