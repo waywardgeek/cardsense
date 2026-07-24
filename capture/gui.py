@@ -2,7 +2,12 @@
 """cardsense GUI — card detector with speed/voice controls.
 
 Launch this instead of detect.py --loop for a controllable live session.
+
+Usage:
+    python3 gui.py          # Normal mode (no debug files)
+    python3 gui.py --debug  # Debug mode (save crops to /tmp)
 """
+import argparse
 import os
 import platform
 import signal
@@ -252,9 +257,10 @@ class Speaker:
 
 # ── Detector loop (runs in background thread) ─────────────────────────────
 class Detector:
-    def __init__(self, speaker, on_status=None):
+    def __init__(self, speaker, on_status=None, debug=False):
         self.speaker = speaker
         self.on_status = on_status  # callback(str) for GUI status label
+        self.debug = debug  # Enable debug file writes to /tmp
         self.running = False
         self._thread = None
         self.idx = None
@@ -337,7 +343,7 @@ class Detector:
                 hit = self.idx.identify(crop)
 
                 # Debug: save crops when match should succeed but doesn't
-                if not hit and no_card_count < 3:  # Card was recently present, likely a match failure
+                if self.debug and not hit and no_card_count < 3:  # Card was recently present, likely a match failure
                     debug_path = f"/tmp/cardsense_nomatch_{frame_num}.png"
                     cv2.imwrite(debug_path, crop)
                     print(f"[DEBUG] Match failure: saved crop to {debug_path}", flush=True)
@@ -351,10 +357,12 @@ class Detector:
                         print(f"[CALIBRATE] first match: {name} d={dist} m={margin}, twiddling...", flush=True)
                         self.speaker.speak("Calibrating")  # Short message, completes before twiddle
                         time.sleep(0.3)  # Let "Calibrating" start before twiddle begins
-                        debug = shot.copy()
-                        cv2.rectangle(debug, (x, y), (x+w, y+h), (0, 255, 0), 3)
-                        cv2.imwrite("/tmp/cardsense_box.png", debug)
-                        cv2.imwrite("/tmp/cardsense_crop.png", crop)
+                        
+                        if self.debug:
+                            debug = shot.copy()
+                            cv2.rectangle(debug, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                            cv2.imwrite("/tmp/cardsense_box.png", debug)
+                            cv2.imwrite("/tmp/cardsense_crop.png", crop)
 
                         card_box, dist, margin = self._twiddle(shot, card_box, self.idx)
                         calibrated = True
@@ -444,9 +452,9 @@ VOICES = [
 ]
 
 
-def build_gui():
+def build_gui(debug=False):
     speaker = Speaker()
-    detector = Detector(speaker)
+    detector = Detector(speaker, debug=debug)
 
     root = tk.Tk()
     root.title("CardSense")
@@ -531,4 +539,8 @@ def build_gui():
 
 
 if __name__ == "__main__":
-    build_gui()
+    parser = argparse.ArgumentParser(description="cardsense GUI - MTGA card reader with TTS")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode (save crops to /tmp)")
+    args = parser.parse_args()
+    
+    build_gui(debug=args.debug)
