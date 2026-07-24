@@ -256,9 +256,9 @@ class Detector:
     def _twiddle(shot, box, idx):
         """Refine the crop box to minimize pHash distance.
 
-        Nudge x, y, w, h by a percentage, keep if distance improves or
-        stays equal. Run at 1% steps first, then 0.1% for fine tuning.
+        Uses raw hamming distance (no full index scan) for speed.
         """
+        from phash import dual_phash, hamming_scan
         x, y, w, h = box
         H_max, W_max = shot.shape[:2]
 
@@ -269,18 +269,17 @@ class Detector:
             if bx + bw > W_max or by + bh > H_max:
                 return 9999
             crop = cv2.cvtColor(shot[by:by+bh, bx:bx+bw], cv2.COLOR_BGR2GRAY)
-            hit = idx.identify(crop, max_dist=9999, min_margin=0)
-            if hit is None:
-                return 9999
-            return hit[1]  # distance
+            d = hamming_scan(dual_phash(crop), idx.bits)
+            return int(d.min())
 
         best_score = score(x, y, w, h)
-        print(f"[TWIDDLE] start box=({x},{y},{w},{h}) dist={best_score}", flush=True)
 
         for pct in (0.01, 0.001):
             improved = True
-            while improved:
+            rounds = 0
+            while improved and rounds < 50:
                 improved = False
+                rounds += 1
                 for dim in range(4):  # x, y, w, h
                     for sign in (+1, -1):
                         trial = [x, y, w, h]
@@ -292,7 +291,7 @@ class Detector:
                             best_score = s
                             improved = True
 
-        print(f"[TWIDDLE] done  box=({x},{y},{w},{h}) dist={best_score}", flush=True)
+        print(f"[TWIDDLE] done box=({x},{y},{w},{h}) dist={best_score}", flush=True)
 
         # Get margin for the final box
         crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
