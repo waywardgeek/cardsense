@@ -96,63 +96,76 @@ def describe(meta):
     return ". ".join(parts)
 
 
-# ── TTS (macOS NSSpeechSynthesizer — in-process, OS priority) ──────────────
+# ── TTS (NSSpeechSynthesizer on dedicated thread with NSRunLoop) ───────────
 class Speaker:
-    """Uses NSSpeechSynthesizer for instant, OS-prioritized speech.
-    
-    speak/cancel must be called from the main thread (NSRunLoop requirement).
-    Use schedule_speak() from background threads — it dispatches via tkinter.
-    """
+    """NSSpeechSynthesizer on its own thread with a running NSRunLoop."""
 
     def __init__(self):
+        import queue
+        self._queue = queue.Queue()
+        self._synth = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(5.0)  # wait for NSRunLoop to start
+
+    def _run_loop(self):
+        """Dedicated thread: create synth + pump NSRunLoop forever."""
         from AppKit import NSSpeechSynthesizer
+        from Foundation import NSRunLoop, NSDate
         voice = 'com.apple.eloquence.en-US.Reed'
         self._synth = NSSpeechSynthesizer.alloc().initWithVoice_(voice)
         self._synth.setRate_(550)
         self.rate = 550
         self.voice = voice
-        self._root = None  # set by build_gui to enable cross-thread dispatch
+        self._ready.set()
 
-    def set_rate(self, rate):
-        self.rate = rate
-        self._synth.setRate_(rate)
+        while True:
+            # Drain command queue
+            while not self._queue.empty():
+                cmd, args = self._queue.get_nowait()
+                if cmd == "speak":
+                    self._synth.stopSpeaking()
+                    self._synth.startSpeakingString_(args)
+                elif cmd == "cancel":
+                    self._synth.stopSpeaking()
+                elif cmd == "rate":
+                    self._synth.setRate_(args)
+                elif cmd == "voice":
+                    self._set_voice_inner(args)
+            # Pump the run loop briefly
+            NSRunLoop.currentRunLoop().runUntilDate_(
+                NSDate.dateWithTimeIntervalSinceNow_(0.05)
+            )
 
-    def set_voice(self, voice_name):
-        """Set voice by display name (e.g. 'Reed (English (US))')."""
+    def _set_voice_inner(self, voice_name):
         from AppKit import NSSpeechSynthesizer
-        # Map display names to voice IDs
         voices = NSSpeechSynthesizer.availableVoices()
-        for v in voices:
-            attrs = NSSpeechSynthesizer.attributesForVoice_(v)
-            if attrs and voice_name in str(attrs.get('VoiceName', '')):
-                self._synth.setVoice_(v)
-                self.voice = voice_name
-                return
-        # Fallback: try matching by keyword
         key = voice_name.split('(')[0].strip().lower()
         for v in voices:
             if key in v.lower():
                 self._synth.setVoice_(v)
-                self.voice = voice_name
                 return
 
+    def set_rate(self, rate):
+        self.rate = rate
+        self._queue.put(("rate", rate))
+
+    def set_voice(self, voice_name):
+        self.voice = voice_name
+        self._queue.put(("voice", voice_name))
+
     def cancel(self):
-        self._synth.stopSpeaking()
+        self._queue.put(("cancel", None))
 
     def is_speaking(self):
-        return self._synth.isSpeaking()
+        return self._synth.isSpeaking() if self._synth else False
 
     def speak(self, text):
-        """Speak text — must be called from main thread."""
-        self._synth.stopSpeaking()
-        self._synth.startSpeakingString_(text)
+        self._queue.put(("speak", text))
 
     def schedule_speak(self, text):
-        """Thread-safe: dispatch speak to main thread via tkinter."""
-        if self._root:
-            self._root.after(0, lambda: self.speak(text))
-        else:
-            self.speak(text)  # fallback if no root set
+        self.speak(text)
 
 
 # ── Detector loop (runs in background thread) ─────────────────────────────
@@ -223,6 +236,7 @@ class Detector:
             print(f"[INIT] screen={W}x{H} box=({bx},{by},{bw},{bh})", flush=True)
 
             self._set_status("Watching... right-click a card")
+            self.speaker.speak("CardSense ready")
             while self.running:
                 shot = np.array(sct.grab(mon))[:, :, :3]
 
@@ -328,7 +342,6 @@ def build_gui():
     root = tk.Tk()
     root.title("CardSense")
     root.geometry("480x280")
-    speaker._root = root  # enable cross-thread speech dispatch
     root.resizable(False, False)
 
     # Status label
