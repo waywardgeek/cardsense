@@ -190,99 +190,65 @@ class Detector:
             self._set_status(f"Index loaded: {len(self.idx)} cards")
 
         # Initial card box guess (fractions of screen) — left-side right-click zoom
-        # Measured from screenshot: x 1-24%, y 4-69%
         BOX_FRAC = (0.01, 0.04, 0.23, 0.65)  # (x_frac, y_frac, w_frac, h_frac)
-
-        # Motion gate thresholds
-        MOTION_THRESH = 15.0      # mean pixel diff to detect "something changed"
-        QUIET_THRESH = 3.0        # mean pixel diff to detect "screen settled"
-        QUIET_FRAMES_NEEDED = 3   # consecutive quiet frames before we analyze
-        NO_CARD_FRAMES = 5        # frames with no match before resetting
+        NO_CARD_FRAMES = 10
 
         last_name = None
-        prev_frame = None
-        card_box = None           # locked (x, y, w, h) in pixels after twiddle
+        card_box = None
         calibrated = False
+        no_card_count = 0
 
         with mss.MSS() as sct:
             mon = sct.monitors[1]
             H, W = mon["height"], mon["width"]
 
-            # Convert fractional box to pixel box (initial guess)
             bx = int(BOX_FRAC[0] * W)
             by = int(BOX_FRAC[1] * H)
             bw = int(BOX_FRAC[2] * W)
             bh = int(BOX_FRAC[3] * H)
             card_box = (bx, by, bw, bh)
-
-            state = "idle"        # idle -> motion -> settling -> identify
-            quiet_count = 0
-            no_card_count = 0
+            print(f"[INIT] screen={W}x{H} box=({bx},{by},{bw},{bh})", flush=True)
 
             self._set_status("Watching... right-click a card")
             while self.running:
                 shot = np.array(sct.grab(mon))[:, :, :3]
-                gray = cv2.cvtColor(
-                    cv2.resize(shot, (W // 4, H // 4)),
-                    cv2.COLOR_BGR2GRAY
-                )
 
-                if prev_frame is not None:
-                    diff_mean = np.mean(cv2.absdiff(gray, prev_frame))
+                x, y, w, h = card_box
+                crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+                hit = self.idx.identify(crop)
+
+                if hit:
+                    meta, dist, margin = hit
+                    name = meta["name"]
+
+                    # Twiddle to refine the box on first successful match
+                    if not calibrated:
+                        print(f"[CALIBRATE] first match: {name} d={dist} m={margin}, twiddling...", flush=True)
+                        debug = shot.copy()
+                        cv2.rectangle(debug, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                        cv2.imwrite("/tmp/cardsense_box.png", debug)
+                        cv2.imwrite("/tmp/cardsense_crop.png", crop)
+
+                        card_box, dist, margin = self._twiddle(shot, card_box, self.idx)
+                        calibrated = True
+                        x, y, w, h = card_box
+                        crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+                        hit2 = self.idx.identify(crop)
+                        if hit2:
+                            meta, dist, margin = hit2
+                            name = meta["name"]
+
+                    no_card_count = 0
+                    if name != last_name:
+                        last_name = name
+                        print(f"[DETECT] {name} d={dist} m={margin} box={card_box}", flush=True)
+                        self._set_status(f"🃏 {name}  (d={dist} m={margin})")
+                        self.speaker.speak(describe(meta))
                 else:
-                    diff_mean = 0.0
-                prev_frame = gray
-
-                if state == "idle":
-                    if diff_mean > MOTION_THRESH:
-                        state = "motion"
-                        quiet_count = 0
-                        print(f"[GATE] motion detected diff={diff_mean:.1f}", flush=True)
-
-                elif state == "motion":
-                    if diff_mean < QUIET_THRESH:
-                        quiet_count += 1
-                        if quiet_count >= QUIET_FRAMES_NEEDED:
-                            state = "identify"
-                    else:
-                        quiet_count = 0
-
-                elif state == "identify":
-                    x, y, w, h = card_box
-                    crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
-                    hit = self.idx.identify(crop)
-
-                    if hit:
-                        meta, dist, margin = hit
-                        name = meta["name"]
-
-                        # Twiddle to refine the box if not yet calibrated
-                        if not calibrated:
-                            card_box, dist, margin = self._twiddle(
-                                shot, card_box, self.idx
-                            )
-                            calibrated = True
-                            # Re-identify with refined box
-                            x, y, w, h = card_box
-                            crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
-                            hit2 = self.idx.identify(crop)
-                            if hit2:
-                                meta, dist, margin = hit2
-                                name = meta["name"]
-
-                        if name != last_name:
-                            last_name = name
-                            no_card_count = 0
-                            print(f"[DETECT] {name} d={dist} m={margin} box={card_box} cal={calibrated}", flush=True)
-                            self._set_status(f"🃏 {name}  (d={dist} m={margin})")
-                            self.speaker.speak(describe(meta))
-                    else:
-                        no_card_count += 1
-                        if no_card_count >= NO_CARD_FRAMES and last_name is not None:
-                            last_name = None
-                            self._set_status("Watching...")
-
-                    state = "idle"
+                    no_card_count += 1
+                    if no_card_count >= NO_CARD_FRAMES and last_name is not None:
+                        last_name = None
+                        self._set_status("Watching...")
 
         self._set_status("Stopped")
 
