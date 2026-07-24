@@ -98,7 +98,11 @@ def describe(meta):
 
 # ── TTS (macOS NSSpeechSynthesizer — in-process, OS priority) ──────────────
 class Speaker:
-    """Uses NSSpeechSynthesizer for instant, OS-prioritized speech."""
+    """Uses NSSpeechSynthesizer for instant, OS-prioritized speech.
+    
+    speak/cancel must be called from the main thread (NSRunLoop requirement).
+    Use schedule_speak() from background threads — it dispatches via tkinter.
+    """
 
     def __init__(self):
         from AppKit import NSSpeechSynthesizer
@@ -107,6 +111,7 @@ class Speaker:
         self._synth.setRate_(550)
         self.rate = 550
         self.voice = voice
+        self._root = None  # set by build_gui to enable cross-thread dispatch
 
     def set_rate(self, rate):
         self.rate = rate
@@ -138,8 +143,16 @@ class Speaker:
         return self._synth.isSpeaking()
 
     def speak(self, text):
+        """Speak text — must be called from main thread."""
         self._synth.stopSpeaking()
         self._synth.startSpeakingString_(text)
+
+    def schedule_speak(self, text):
+        """Thread-safe: dispatch speak to main thread via tkinter."""
+        if self._root:
+            self._root.after(0, lambda: self.speak(text))
+        else:
+            self.speak(text)  # fallback if no root set
 
 
 # ── Detector loop (runs in background thread) ─────────────────────────────
@@ -243,7 +256,7 @@ class Detector:
                         last_name = name
                         print(f"[DETECT] {name} d={dist} m={margin} box={card_box}", flush=True)
                         self._set_status(f"🃏 {name}  (d={dist} m={margin})")
-                        self.speaker.speak(describe(meta))
+                        self.speaker.schedule_speak(describe(meta))
                 else:
                     no_card_count += 1
                     if no_card_count >= NO_CARD_FRAMES and last_name is not None:
@@ -315,6 +328,7 @@ def build_gui():
     root = tk.Tk()
     root.title("CardSense")
     root.geometry("480x280")
+    speaker._root = root  # enable cross-thread speech dispatch
     root.resizable(False, False)
 
     # Status label
