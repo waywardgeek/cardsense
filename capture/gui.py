@@ -35,10 +35,10 @@ except ImportError:
 # ── Calibration persistence ────────────────────────────────────────────────
 CALIBRATION_FILE = os.path.join(DATA_DIR, "calibration.json")
 
-# Reference box for 1920×1080 (Bill's current setup, post-twiddle)
+# Reference box for 1920×1080 (Bill's calibrated setup)
 # This is the hard-coded default, scaled for other resolutions
 REF_SCREEN = (1920, 1080)
-REF_BOX = (19, 43, 441, 702)  # (x, y, w, h) at 1920×1080
+REF_BOX = (21, 47, 449, 709)  # (x, y, w, h) at 1920×1080
 
 
 def load_calibration(screen_w, screen_h):
