@@ -29,29 +29,62 @@ MIN_BLOB_PX = 500
 DS = 4  # downsample factor for fast diff
 
 
-def find_presented(frame_bgr, background):
+def find_presented(frame_bgr, background, debug=False):
     """Return (x,y,w,h) of the presented card, or None.
 
     Uses cv2.absdiff at full res (~22ms). The background must be recent
     (updated every quiet frame) so only the zoomed card shows in the diff.
     """
     if background is None:
+        if debug:
+            print("[FIND] no background", flush=True)
         return None
     H, W = frame_bgr.shape[:2]
     diff = np.max(cv2.absdiff(frame_bgr, background), axis=2)
+    diff_mean = np.mean(diff)
+    diff_max = np.max(diff)
     mask = (diff > DIFF_THRESH).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if debug:
+        print(f"[FIND] diff mean={diff_mean:.1f} max={diff_max} labels={n_labels-1} mask_pct={np.count_nonzero(mask)*100/(H*W):.1f}%", flush=True)
     best = None
     for i in range(1, n_labels):
         x, y, w, h, area = stats[i]
         if area < MIN_BLOB_PX or h == 0:
             continue
         ar, hf = w / h, h / H
+        if debug and area > 5000:
+            passed = ASPECT_MIN <= ar <= ASPECT_MAX and hf >= PRESENT_HF
+            print(f"  blob {i}: {w}x{h} ar={ar:.2f} hf={hf:.2f} area={area} {'PASS' if passed else 'FAIL'}", flush=True)
         if ASPECT_MIN <= ar <= ASPECT_MAX and hf >= PRESENT_HF:
             if best is None or h > best[0]:
                 best = (h, (x, y, w, h))
     return best[1] if best else None
+
+
+def find_all_candidates(frame_bgr, background):
+    """Return list of (x,y,w,h) for all card-shaped diff blobs.
+
+    Unlike find_presented which returns only the tallest, this returns all
+    candidates so the caller can try identifying each one.
+    """
+    if background is None:
+        return []
+    H, W = frame_bgr.shape[:2]
+    diff = np.max(cv2.absdiff(frame_bgr, background), axis=2)
+    mask = (diff > DIFF_THRESH).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    results = []
+    for i in range(1, n_labels):
+        x, y, w, h, area = stats[i]
+        if area < MIN_BLOB_PX or h == 0:
+            continue
+        ar, hf = w / h, h / H
+        if ASPECT_MIN <= ar <= ASPECT_MAX and hf >= PRESENT_HF:
+            results.append((x, y, w, h))
+    return results
 
 
 def describe(meta):
@@ -63,32 +96,50 @@ def describe(meta):
     return ". ".join(parts)
 
 
-# ── TTS (macOS say, with reliable cancel) ──────────────────────────────────
+# ── TTS (macOS NSSpeechSynthesizer — in-process, OS priority) ──────────────
 class Speaker:
-    """Manages a single `say` subprocess with reliable cancel."""
+    """Uses NSSpeechSynthesizer for instant, OS-prioritized speech."""
 
     def __init__(self):
-        self._proc = None
-        self._lock = threading.Lock()
-        self.rate = 350          # WPM — updated by GUI slider
-        self.voice = "Samantha"  # updated by GUI dropdown
+        from AppKit import NSSpeechSynthesizer
+        voice = 'com.apple.eloquence.en-US.Reed'
+        self._synth = NSSpeechSynthesizer.alloc().initWithVoice_(voice)
+        self._synth.setRate_(350)
+        self.rate = 350
+        self.voice = voice
+
+    def set_rate(self, rate):
+        self.rate = rate
+        self._synth.setRate_(rate)
+
+    def set_voice(self, voice_name):
+        """Set voice by display name (e.g. 'Reed (English (US))')."""
+        from AppKit import NSSpeechSynthesizer
+        # Map display names to voice IDs
+        voices = NSSpeechSynthesizer.availableVoices()
+        for v in voices:
+            attrs = NSSpeechSynthesizer.attributesForVoice_(v)
+            if attrs and voice_name in str(attrs.get('VoiceName', '')):
+                self._synth.setVoice_(v)
+                self.voice = voice_name
+                return
+        # Fallback: try matching by keyword
+        key = voice_name.split('(')[0].strip().lower()
+        for v in voices:
+            if key in v.lower():
+                self._synth.setVoice_(v)
+                self.voice = voice_name
+                return
 
     def cancel(self):
-        with self._lock:
-            if self._proc and self._proc.poll() is None:
-                try:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-                self._proc = None
+        self._synth.stopSpeaking()
+
+    def is_speaking(self):
+        return self._synth.isSpeaking()
 
     def speak(self, text):
-        self.cancel()
-        with self._lock:
-            cmd = ["say", "-v", self.voice, "-r", str(self.rate), text]
-            self._proc = subprocess.Popen(
-                cmd, preexec_fn=os.setsid  # new process group for clean kill
-            )
+        self._synth.stopSpeaking()
+        self._synth.startSpeakingString_(text)
 
 
 # ── Detector loop (runs in background thread) ─────────────────────────────
@@ -119,6 +170,15 @@ class Detector:
 
     def _loop(self):
         try:
+            self._loop_inner()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[ERROR] Detector crashed: {e}", flush=True)
+            self._set_status(f"ERROR: {e}")
+
+    def _loop_inner(self):
+        try:
             import mss
         except ImportError:
             self._set_status("ERROR: pip install mss")
@@ -131,53 +191,68 @@ class Detector:
 
         background = None
         last_name = None
-        frame_count = 0
-        bg_time = 0  # time.monotonic() when background was last set
         fps_time = time.monotonic()
         fps_count = 0
+
+        from collections import deque
+        RING_SIZE = 10
+        ring = deque(maxlen=RING_SIZE)
+
+        no_card_count = 0
+        NO_CARD_FRAMES = 5
 
         with mss.MSS() as sct:
             mon = sct.monitors[1]
             self._set_status("Watching... right-click a card")
             while self.running:
+                # While speaking, do NOTHING — no screen grabs at all.
+                # Screen capture may block macOS audio resources.
+                if self.speaker.is_speaking():
+                    time.sleep(0.1)
+                    continue
+
+                tg0 = time.monotonic()
                 shot = np.array(sct.grab(mon))[:, :, :3]
-                frame_count += 1
+                tg1 = time.monotonic()
                 fps_count += 1
                 now_fps = time.monotonic()
                 if now_fps - fps_time >= 1.0:
                     self.fps = fps_count / (now_fps - fps_time)
                     fps_count = 0
                     fps_time = now_fps
-                    # Always show FPS, even when idle
                     if last_name is None:
                         self._set_status(f"Watching... ({self.fps:.1f} fps)")
-                box = find_presented(shot, background)
 
-                if box is None:
-                    now = time.monotonic()
-                    # Update background at most every 0.5s when no card showing
-                    # This keeps it fresh but avoids mid-animation captures
-                    if background is None or (now - bg_time) >= 0.5:
-                        background = shot.copy()
-                        bg_time = now
-                    if last_name is not None:
-                        last_name = None
-                        self._set_status(f"Watching... ({self.fps:.1f} fps)")
-                else:
-                    x, y, w, h = box
+                background = ring[0] if len(ring) == RING_SIZE else None
+                candidates = find_all_candidates(shot, background)
+
+                best_hit = None
+                for (x, y, w, h) in candidates:
                     crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                     hit = self.idx.identify(crop)
                     if hit:
                         meta, dist, margin = hit
-                        name = meta["name"]
-                        if name != last_name:
-                            last_name = name
-                            self._set_status(f"🃏 {name}  (d={dist} m={margin}) {self.fps:.1f}fps")
-                            self.speaker.speak(describe(meta))
-                    else:
-                        self._set_status(f"Card? no match ({self.fps:.1f} fps)")
+                        if best_hit is None or margin > best_hit[2]:
+                            best_hit = hit
 
-                # No sleep — grab+diff (~120ms) is the natural throttle
+                if best_hit is not None:
+                    no_card_count = 0
+                    meta, dist, margin = best_hit
+                    name = meta["name"]
+                    if name != last_name:
+                        last_name = name
+                        t_end = time.monotonic()
+                        print(f"[TIMING] total={t_end-tg0:.3f}s candidates={len(candidates)}", flush=True)
+                        self._set_status(f"🃏 {name}  (d={dist} m={margin}) {self.fps:.1f}fps")
+                        self._spoke_frame = shot.copy()
+                        self.speaker.speak(describe(meta))
+                else:
+                    no_card_count += 1
+                    if no_card_count >= NO_CARD_FRAMES and last_name is not None:
+                        last_name = None
+                        self._set_status(f"Watching... ({self.fps:.1f} fps)")
+
+                ring.append(shot.copy())
 
         self._set_status("Stopped")
 
@@ -214,17 +289,17 @@ def build_gui():
     speed_frame = tk.Frame(root)
     speed_frame.pack(padx=10, pady=5, fill="x")
     tk.Label(speed_frame, text="Speed (WPM):").pack(side="left")
-    speed_val = tk.Label(speed_frame, text="350", width=4)
+    speed_val = tk.Label(speed_frame, text="700", width=4)
     speed_val.pack(side="right")
-    speed_slider = tk.Scale(speed_frame, from_=150, to=600, orient="horizontal",
+    speed_slider = tk.Scale(speed_frame, from_=150, to=900, orient="horizontal",
                             showvalue=False, length=300,
                             command=lambda v: _update_speed(v))
-    speed_slider.set(350)
+    speed_slider.set(700)
     speed_slider.pack(side="right", padx=(5, 5))
 
     def _update_speed(v):
         rate = int(float(v))
-        speaker.rate = rate
+        speaker.set_rate(rate)
         speed_val.config(text=str(rate))
 
     # Voice picker
@@ -232,11 +307,11 @@ def build_gui():
     voice_frame.pack(padx=10, pady=5, fill="x")
     tk.Label(voice_frame, text="Voice:").pack(side="left")
     voice_combo = ttk.Combobox(voice_frame, values=VOICES, state="readonly", width=25)
-    voice_combo.set("Samantha")
+    voice_combo.set("Reed (English (US))")
     voice_combo.pack(side="left", padx=(10, 0))
 
     def _update_voice(event):
-        speaker.voice = voice_combo.get()
+        speaker.set_voice(voice_combo.get())
 
     voice_combo.bind("<<ComboboxSelected>>", _update_voice)
 
