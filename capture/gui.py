@@ -272,6 +272,11 @@ class Detector:
                         print(f"[POLL] frame={frame_num} match={hit[0]['name']} d={hit[1]} m={hit[2]} last={last_name}", flush=True)
                     else:
                         print(f"[POLL] frame={frame_num} no match, last={last_name} no_card={no_card_count}", flush=True)
+                        # Save crop for analysis when we have no match but should (low no_card_count)
+                        if no_card_count < 3:  # Card was recently present, likely a match failure
+                            debug_path = f"/tmp/cardsense_nomatch_{frame_num}.png"
+                            cv2.imwrite(debug_path, crop)
+                            print(f"[DEBUG] Saved no-match crop to {debug_path}", flush=True)
 
                 if hit:
                     meta, dist, margin = hit
@@ -279,8 +284,9 @@ class Detector:
 
                     # Twiddle to refine the box on first successful match
                     if not calibrated:
-                        self.speaker.speak(f"Calibrating on {name}")
                         print(f"[CALIBRATE] first match: {name} d={dist} m={margin}, twiddling...", flush=True)
+                        self.speaker.speak("Calibrating")  # Short message, completes before twiddle
+                        time.sleep(0.3)  # Let "Calibrating" start before twiddle begins
                         debug = shot.copy()
                         cv2.rectangle(debug, (x, y), (x+w, y+h), (0, 255, 0), 3)
                         cv2.imwrite("/tmp/cardsense_box.png", debug)
@@ -294,6 +300,7 @@ class Detector:
                         if hit2:
                             meta, dist, margin = hit2
                             name = meta["name"]
+                        # Fall through to normal card speech below (will speak full card text)
 
                     no_card_count = 0
                     if name != last_name:
