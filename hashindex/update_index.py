@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import cv2
@@ -76,18 +77,24 @@ def download_from_github_release():
 
 
 def fetch_bulk_metadata():
-    """Fetch the bulk data list and find the 'default_cards' entry."""
+    """Fetch the bulk data list and find the 'unique_artwork' entry.
+    
+    We use unique_artwork instead of default_cards because:
+    - Includes all printings with different artwork (what we need for visual matching)
+    - Smaller download (253MB vs 532MB)
+    - Covers MTGA's full card pool including modern reprints
+    """
     print("Fetching Scryfall bulk data list...", flush=True)
     resp = requests.get(BULK_LIST_ENDPOINT, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
     bulk_list = resp.json()
     
-    # Find the default_cards entry
+    # Find the unique_artwork entry
     for entry in bulk_list.get("data", []):
-        if entry.get("type") == "default_cards":
+        if entry.get("type") == "unique_artwork":
             return entry
     
-    raise RuntimeError("Could not find 'default_cards' in Scryfall bulk data list")
+    raise RuntimeError("Could not find 'unique_artwork' in Scryfall bulk data list")
 
 
 def needs_update(force=False):
@@ -117,80 +124,107 @@ def needs_update(force=False):
     return False, "index up-to-date"
 
 
-def download_and_hash(cards, verbose=True):
-    """Download card images on-the-fly, hash them, return (bits, ids, meta)."""
-    bits_list, ids, meta = [], [], []
-    n_ok = n_missing_img = n_download_fail = n_hash_fail = 0
+def _download_and_hash_card(args):
+    """Download and hash a single card. For use with multiprocessing.Pool."""
+    card, temp_dir = args
     
+    card_id = card.get("id")
+    if not card_id:
+        return None, "no_id"
+    
+    # Get image URL
+    image_uris = card.get("image_uris", {})
+    if not image_uris:
+        faces = card.get("card_faces", [])
+        if faces and faces[0].get("image_uris"):
+            image_uris = faces[0]["image_uris"]
+    
+    img_url = image_uris.get("normal") or image_uris.get("large")
+    if not img_url:
+        return None, "missing_img"
+    
+    # Download image
+    temp_path = os.path.join(temp_dir, f"{card_id}.jpg")
+    try:
+        resp = requests.get(img_url, headers={"User-Agent": USER_AGENT}, timeout=10)
+        resp.raise_for_status()
+        with open(temp_path, 'wb') as f:
+            f.write(resp.content)
+    except Exception as e:
+        return None, "download_fail"
+    
+    # Hash image
+    try:
+        gray = cv2.imread(temp_path, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            return None, "hash_fail"
+        
+        bits = dual_phash(gray)
+        card_meta = {
+            "id": card_id,
+            "name": card.get("name"),
+            "type_line": card.get("type_line"),
+            "mana_cost": card.get("mana_cost"),
+            "oracle_text": card.get("oracle_text")
+        }
+        
+        return (bits, card_id, card_meta), "ok"
+    except Exception as e:
+        return None, "hash_fail"
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def download_and_hash(cards, verbose=True, parallel=True):
+    """Download card images on-the-fly, hash them, return (bits, ids, meta).
+    
+    Args:
+        parallel: Use multiprocessing for parallel downloads (default: True)
+    """
     temp_dir = os.path.join(DATA_DIR, "temp_images")
     os.makedirs(temp_dir, exist_ok=True)
     
     t0 = time.time()
     
-    for i, card in enumerate(cards):
+    if parallel:
+        # Parallel processing
+        n_workers = min(cpu_count(), 8)  # Cap at 8 to avoid overwhelming Scryfall
+        print(f"  Using {n_workers} parallel workers", flush=True)
+        
+        with Pool(n_workers) as pool:
+            args = [(card, temp_dir) for card in cards]
+            results = pool.map(_download_and_hash_card, args)
+    else:
+        # Serial processing (old path)
+        results = [_download_and_hash_card((card, temp_dir)) for card in cards]
+    
+    # Collect results
+    bits_list, ids, meta = [], [], []
+    n_ok = n_missing_img = n_download_fail = n_hash_fail = 0
+    
+    for i, (result, status) in enumerate(results):
         if verbose and i % 1000 == 0 and i > 0:
             elapsed = time.time() - t0
             rate = i / elapsed
-            eta = (len(cards) - i) / rate if rate > 0 else 0
-            print(f"  {i}/{len(cards)} hashed ({elapsed:.0f}s, {rate:.1f}/s, ETA {eta:.0f}s) "
+            eta = (len(results) - i) / rate if rate > 0 else 0
+            print(f"  {i}/{len(results)} processed ({elapsed:.0f}s, {rate:.1f}/s, ETA {eta:.0f}s) "
                   f"ok={n_ok} missing={n_missing_img} fail={n_download_fail+n_hash_fail}",
                   flush=True)
         
-        card_id = card.get("id")
-        if not card_id:
-            continue
-        
-        # Get image URL - prefer 'normal' size
-        image_uris = card.get("image_uris", {})
-        if not image_uris:
-            # Check card_faces for double-faced cards
-            faces = card.get("card_faces", [])
-            if faces and faces[0].get("image_uris"):
-                image_uris = faces[0]["image_uris"]
-        
-        img_url = image_uris.get("normal") or image_uris.get("large")
-        if not img_url:
-            n_missing_img += 1
-            continue
-        
-        # Download image to temp file
-        temp_path = os.path.join(temp_dir, f"{card_id}.jpg")
-        try:
-            resp = requests.get(img_url, headers={"User-Agent": USER_AGENT}, timeout=10)
-            resp.raise_for_status()
-            with open(temp_path, 'wb') as f:
-                f.write(resp.content)
-        except Exception as e:
-            n_download_fail += 1
-            if verbose and n_download_fail <= 5:
-                print(f"    Download failed for {card.get('name')}: {e}", flush=True)
-            continue
-        
-        # Read and hash
-        try:
-            gray = cv2.imread(temp_path, cv2.IMREAD_GRAYSCALE)
-            if gray is None:
-                n_hash_fail += 1
-                continue
-            
-            bits_list.append(dual_phash(gray))
+        if result:
+            bits, card_id, card_meta = result
+            bits_list.append(bits)
             ids.append(card_id)
-            meta.append({
-                "id": card_id,
-                "name": card.get("name"),
-                "type_line": card.get("type_line"),
-                "mana_cost": card.get("mana_cost"),
-                "oracle_text": card.get("oracle_text")
-            })
+            meta.append(card_meta)
             n_ok += 1
-        except Exception as e:
-            n_hash_fail += 1
-            if verbose and n_hash_fail <= 5:
-                print(f"    Hash failed for {card.get('name')}: {e}", flush=True)
-        finally:
-            # Delete temp image immediately
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+        else:
+            if status == "missing_img":
+                n_missing_img += 1
+            elif status == "download_fail":
+                n_download_fail += 1
+            elif status == "hash_fail":
+                n_hash_fail += 1
     
     # Clean up temp directory
     try:
@@ -206,8 +240,13 @@ def download_and_hash(cards, verbose=True):
     return bits, np.array(ids), meta
 
 
-def update_index(force=False):
-    """Main update workflow."""
+def update_index(force=False, parallel=True):
+    """Main update workflow.
+    
+    Args:
+        force: Force update even if current
+        parallel: Use parallel downloads (default: True, ~8x faster)
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     
     # Check if update needed
@@ -245,8 +284,8 @@ def update_index(force=False):
     
     print(f"Loaded {len(cards)} card records", flush=True)
     
-    # Download images on-the-fly and hash
-    bits, ids, meta = download_and_hash(cards)
+    # Download images on-the-fly and hash (with parallel downloads)
+    bits, ids, meta = download_and_hash(cards, parallel=parallel)
     
     if len(bits) == 0:
         print("ERROR: No cards successfully hashed", flush=True)
@@ -273,6 +312,7 @@ def main():
     ap = argparse.ArgumentParser(description="Update cardsense pHash index from Scryfall")
     ap.add_argument("--force", action="store_true", help="Force update even if current")
     ap.add_argument("--check-only", action="store_true", help="Only check if update needed")
+    ap.add_argument("--no-parallel", action="store_true", help="Disable parallel downloads (slower but easier to debug)")
     args = ap.parse_args()
     
     if args.check_only:
@@ -280,7 +320,7 @@ def main():
         print(f"Update {'needed' if need_update else 'not needed'}: {reason}", flush=True)
         sys.exit(0 if not need_update else 1)
     
-    success = update_index(args.force)
+    success = update_index(args.force, parallel=not args.no_parallel)
     sys.exit(0 if success else 1)
 
 
