@@ -14,18 +14,20 @@ perceptual hashing.
 ## Quick Start
 
 ```bash
-# First run (auto-updates hash index from Scryfall)
-cd ~/projects/cardsense
+# Clone and install
+git clone https://github.com/waywardgeek/cardsense.git
+cd cardsense
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+
+# First run (auto-downloads hash index from GitHub, ~5 seconds)
 venv/bin/python3 capture/gui.py
 
-# Manual index update
-venv/bin/python3 hashindex/update_index.py --force
-
-# Check if update available (no download)
-venv/bin/python3 hashindex/update_index.py --check-only
+# Right-click a card in MTGA → hear card name + oracle text
 ```
 
-Right-click a card in MTGA → hear card name + oracle text
+**First run**: Downloads 26MB hash index from GitHub release (~5s)  
+**Subsequent runs**: Instant startup (checks for updates, skips if current)
 
 ## Layout
 
