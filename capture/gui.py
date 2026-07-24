@@ -104,8 +104,8 @@ class Speaker:
         from AppKit import NSSpeechSynthesizer
         voice = 'com.apple.eloquence.en-US.Reed'
         self._synth = NSSpeechSynthesizer.alloc().initWithVoice_(voice)
-        self._synth.setRate_(350)
-        self.rate = 350
+        self._synth.setRate_(550)
+        self.rate = 550
         self.voice = voice
 
     def set_rate(self, rate):
@@ -302,7 +302,7 @@ def build_gui():
     speed_slider = tk.Scale(speed_frame, from_=150, to=900, orient="horizontal",
                             showvalue=False, length=300,
                             command=lambda v: _update_speed(v))
-    speed_slider.set(700)
+    speed_slider.set(550)
     speed_slider.pack(side="right", padx=(5, 5))
 
     def _update_speed(v):
