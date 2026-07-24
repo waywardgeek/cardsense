@@ -266,17 +266,11 @@ class Detector:
                 crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                 hit = self.idx.identify(crop)
 
-                # Periodic debug: log every 20 frames (~1s)
-                if frame_num % 20 == 0:
-                    if hit:
-                        print(f"[POLL] frame={frame_num} match={hit[0]['name']} d={hit[1]} m={hit[2]} last={last_name}", flush=True)
-                    else:
-                        print(f"[POLL] frame={frame_num} no match, last={last_name} no_card={no_card_count}", flush=True)
-                        # Save crop for analysis when we have no match but should (low no_card_count)
-                        if no_card_count < 3:  # Card was recently present, likely a match failure
-                            debug_path = f"/tmp/cardsense_nomatch_{frame_num}.png"
-                            cv2.imwrite(debug_path, crop)
-                            print(f"[DEBUG] Saved no-match crop to {debug_path}", flush=True)
+                # Debug: save crops when match should succeed but doesn't
+                if not hit and no_card_count < 3:  # Card was recently present, likely a match failure
+                    debug_path = f"/tmp/cardsense_nomatch_{frame_num}.png"
+                    cv2.imwrite(debug_path, crop)
+                    print(f"[DEBUG] Match failure: saved crop to {debug_path}", flush=True)
 
                 if hit:
                     meta, dist, margin = hit
