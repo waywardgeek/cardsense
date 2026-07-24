@@ -44,7 +44,7 @@ ASPECT_MIN, ASPECT_MAX = 0.58, 0.88     # real card ratio ~0.716
 PRESENT_HF = 0.35                        # presented card >= 35% of frame height
                                          # (measured: presented ~0.44-0.48, hand ~0.21)
 # --- Speech (cross-platform) ---
-SAY_RATE_WPM = 220        # macOS `say -r` words/min
+SAY_RATE_WPM = 700        # macOS `say -r` words/min (Bill listens at 750)
 SPD_RATE = 10             # Linux `spd-say -r` (-100..100)
 _say_proc = None
 
@@ -68,16 +68,38 @@ def speak(text, interrupt=True):
     _say_proc = subprocess.Popen(cmd)
 
 
+_background = None   # last frame where no card was detected
+DIFF_THRESH = 25     # per-pixel color diff threshold
+MIN_BLOB_PX = 500    # minimum blob size in pixels
+
+
 def find_presented(frame_bgr):
-    """Return (x,y,w,h) of the presented card, or None if none is presented."""
+    """Return (x,y,w,h) of the presented card, or None if none is presented.
+
+    Uses frame-diff against a stored background: when a card zooms up, the diff
+    blob isolates it regardless of board complexity. The background is updated
+    whenever no card is found (i.e. the screen is 'quiet').
+    """
+    global _background
     H, W = frame_bgr.shape[:2]
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.dilate(cv2.Canny(gray, 40, 120), np.ones((5, 5), np.uint8), iterations=2)
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if _background is None:
+        _background = frame_bgr.copy()
+        return None
+
+    # Color diff: max absolute channel difference (catches dark borders that
+    # grayscale diff misses)
+    diff = np.max(np.abs(frame_bgr.astype(np.int16) - _background.astype(np.int16)), axis=2)
+    mask = (diff > DIFF_THRESH).astype(np.uint8) * 255
+    # Close small gaps in the card interior
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+
+    # Connected components
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
     best = None  # (height, box)
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        if h == 0:
+    for i in range(1, n_labels):  # skip background label 0
+        x, y, w, h, area = stats[i]
+        if area < MIN_BLOB_PX or h == 0:
             continue
         ar, hf = w / h, h / H
         if ASPECT_MIN <= ar <= ASPECT_MAX and hf >= PRESENT_HF:
@@ -98,8 +120,11 @@ def describe(meta):
 
 def handle_frame(frame_bgr, idx, quiet=False, verbose=False):
     """Localize + identify the presented card in one frame. Returns meta or None."""
+    global _background
     box = find_presented(frame_bgr)
     if box is None:
+        # No card detected — this is a quiet frame, update the background
+        _background = frame_bgr.copy()
         if verbose:
             print("  (no card presented)")
         return None
@@ -111,10 +136,7 @@ def handle_frame(frame_bgr, idx, quiet=False, verbose=False):
             print(f"  card at {box} but no confident match")
         return None
     meta, dist, margin = hit
-    text = describe(meta)
     print(f"  MATCH: {meta['name']}  (dist={dist} margin={margin})")
-    if not quiet:
-        speak(text)
     return meta
 
 
@@ -151,6 +173,10 @@ def main():
                 meta = handle_frame(shot, idx, quiet=a.quiet)
                 if meta and meta["name"] != last_name:
                     last_name = meta["name"]
+                    if not a.quiet:
+                        # Speak name immediately (interrupts previous),
+                        # then full description
+                        speak(describe(meta), interrupt=True)
                 elif meta is None:
                     last_name = None
                 time.sleep(a.interval)
