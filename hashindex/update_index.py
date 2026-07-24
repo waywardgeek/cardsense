@@ -257,8 +257,8 @@ def update_index(force=False, parallel=True):
     
     print(f"Update needed: {reason}", flush=True)
     
-    # Try fast path: download from GitHub release
-    if download_from_github_release():
+    # Try fast path: download from GitHub release (unless --force)
+    if not force and download_from_github_release():
         # Cache metadata to avoid re-downloading
         bulk_meta = fetch_bulk_metadata()
         with open(METADATA_FILE, "w") as f:
@@ -266,6 +266,8 @@ def update_index(force=False, parallel=True):
         return True
     
     # Slow path: rebuild from Scryfall
+    if force:
+        print("\nForce rebuild requested, skipping GitHub download...", flush=True)
     print("\nRebuilding index from Scryfall bulk data...", flush=True)
     
     # Fetch bulk metadata
