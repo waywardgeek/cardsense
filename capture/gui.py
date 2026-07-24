@@ -190,6 +190,7 @@ class Detector:
             self._set_status(f"Index loaded: {len(self.idx)} cards")
 
         last_name = None
+        last_bbox = None   # sticky location: (x, y, w, h) of last successful match
         fps_time = time.monotonic()
         fps_count = 0
 
@@ -225,16 +226,29 @@ class Detector:
                     if hit:
                         meta, dist, margin = hit
                         if best_hit is None or margin > best_hit[2]:
-                            best_hit = hit
+                            best_hit = (hit, (x, y, w, h))
+
+                # Sticky location: if diff didn't find the card, try the
+                # last known location directly (bypasses frame-diff entirely)
+                if best_hit is None and last_bbox is not None:
+                    sx, sy, sw, sh = last_bbox
+                    H, W = shot.shape[:2]
+                    if sy + sh <= H and sx + sw <= W:
+                        crop = cv2.cvtColor(shot[sy:sy+sh, sx:sx+sw], cv2.COLOR_BGR2GRAY)
+                        hit = self.idx.identify(crop)
+                        if hit:
+                            best_hit = (hit, last_bbox)
 
                 if best_hit is not None:
                     no_card_count = 0
-                    meta, dist, margin = best_hit
+                    (meta, dist, margin), bbox = best_hit
+                    last_bbox = bbox
                     name = meta["name"]
                     if name != last_name:
                         last_name = name
                         t_end = time.monotonic()
-                        print(f"[DETECT] {name} d={dist} m={margin} t={t_end-tg0:.3f}s cands={len(candidates)}", flush=True)
+                        sticky = " (sticky)" if not candidates else ""
+                        print(f"[DETECT] {name} d={dist} m={margin} t={t_end-tg0:.3f}s cands={len(candidates)}{sticky}", flush=True)
                         self._set_status(f"🃏 {name}  (d={dist} m={margin}) {self.fps:.1f}fps")
                         # Cancel any in-progress speech and speak new card
                         self.speaker.speak(describe(meta))
@@ -243,6 +257,7 @@ class Detector:
                     no_card_count += 1
                     if no_card_count >= NO_CARD_FRAMES and last_name is not None:
                         last_name = None
+                        last_bbox = None
                         self._set_status(f"Watching... ({self.fps:.1f} fps)")
                     # No card visible — safe to update background ring
                     ring.append(shot.copy())
