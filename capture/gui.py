@@ -19,6 +19,14 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hashindex"))
 from phash import CardIndex  # noqa: E402
 
+# Import update_index for auto-update check
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+try:
+    from hashindex.update_index import needs_update, update_index
+    HAS_UPDATER = True
+except ImportError:
+    HAS_UPDATER = False
+
 # ── Localization (frame-diff) ──────────────────────────────────────────────
 ASPECT_MIN, ASPECT_MAX = 0.50, 0.95   # widened to catch hover + right-click zoom
 PRESENT_HF = 0.25                      # lowered: hover cards ~35-48%, right-click ~80%
@@ -211,6 +219,18 @@ class Detector:
             return
 
         if self.idx is None:
+            # Auto-update check on first load
+            if HAS_UPDATER:
+                try:
+                    need_update, reason = needs_update(force=False)
+                    if need_update:
+                        self._set_status(f"Updating index: {reason}")
+                        print(f"[UPDATE] {reason}, starting auto-update...", flush=True)
+                        update_index(force=False)
+                        print("[UPDATE] Complete", flush=True)
+                except Exception as e:
+                    print(f"[UPDATE] Failed: {e}, continuing with existing index", flush=True)
+            
             self._set_status("Loading index...")
             self.idx = CardIndex()
             self._set_status(f"Index loaded: {len(self.idx)} cards")
