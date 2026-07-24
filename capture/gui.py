@@ -189,14 +189,13 @@ class Detector:
             self.idx = CardIndex()
             self._set_status(f"Index loaded: {len(self.idx)} cards")
 
-        background = None
         last_name = None
         fps_time = time.monotonic()
         fps_count = 0
 
         from collections import deque
         RING_SIZE = 10
-        ring = deque(maxlen=RING_SIZE)
+        ring = deque(maxlen=RING_SIZE)  # only card-free frames go in here
 
         no_card_count = 0
         NO_CARD_FRAMES = 5
@@ -205,15 +204,8 @@ class Detector:
             mon = sct.monitors[1]
             self._set_status("Watching... right-click a card")
             while self.running:
-                # While speaking, do NOTHING — no screen grabs at all.
-                # Screen capture may block macOS audio resources.
-                if self.speaker.is_speaking():
-                    time.sleep(0.1)
-                    continue
-
                 tg0 = time.monotonic()
                 shot = np.array(sct.grab(mon))[:, :, :3]
-                tg1 = time.monotonic()
                 fps_count += 1
                 now_fps = time.monotonic()
                 if now_fps - fps_time >= 1.0:
@@ -242,17 +234,18 @@ class Detector:
                     if name != last_name:
                         last_name = name
                         t_end = time.monotonic()
-                        print(f"[TIMING] total={t_end-tg0:.3f}s candidates={len(candidates)}", flush=True)
+                        print(f"[DETECT] {name} d={dist} m={margin} t={t_end-tg0:.3f}s cands={len(candidates)}", flush=True)
                         self._set_status(f"🃏 {name}  (d={dist} m={margin}) {self.fps:.1f}fps")
-                        self._spoke_frame = shot.copy()
+                        # Cancel any in-progress speech and speak new card
                         self.speaker.speak(describe(meta))
+                    # Card present — do NOT add to ring (keep background card-free)
                 else:
                     no_card_count += 1
                     if no_card_count >= NO_CARD_FRAMES and last_name is not None:
                         last_name = None
                         self._set_status(f"Watching... ({self.fps:.1f} fps)")
-
-                ring.append(shot.copy())
+                    # No card visible — safe to update background ring
+                    ring.append(shot.copy())
 
         self._set_status("Stopped")
 
