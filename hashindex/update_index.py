@@ -23,8 +23,56 @@ from phash import dual_phash, DATA_DIR
 
 
 BULK_LIST_ENDPOINT = "https://api.scryfall.com/bulk-data"
+GITHUB_RELEASE_API = "https://api.github.com/repos/waywardgeek/cardsense/releases/latest"
 METADATA_FILE = os.path.join(DATA_DIR, "scryfall_metadata.json")
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 cardsense/1.0"
+
+
+def download_from_github_release():
+    """Try to download pre-built hash files from latest GitHub release.
+    
+    Returns True if successful, False if no release or download failed.
+    Much faster than rebuilding from Scryfall (~10s vs 10-20 min).
+    """
+    try:
+        print("Checking for pre-built hash files on GitHub releases...", flush=True)
+        resp = requests.get(GITHUB_RELEASE_API, headers={"User-Agent": USER_AGENT}, timeout=10)
+        if resp.status_code == 404:
+            print("  No GitHub releases found, will rebuild from Scryfall", flush=True)
+            return False
+        resp.raise_for_status()
+        release = resp.json()
+        
+        # Find the hash file assets
+        assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+        if "phash_index.npz" not in assets or "phash_meta.json" not in assets:
+            print("  Release missing hash files, will rebuild from Scryfall", flush=True)
+            return False
+        
+        print(f"  Found release {release['tag_name']}: {release['name']}", flush=True)
+        
+        # Download hash files
+        for filename, url in assets.items():
+            if filename not in ("phash_index.npz", "phash_meta.json"):
+                continue
+            
+            dest = os.path.join(DATA_DIR, filename)
+            print(f"  Downloading {filename}...", flush=True)
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=60)
+            resp.raise_for_status()
+            
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+            
+            size_mb = len(resp.content) / (1024 * 1024)
+            print(f"    ✅ {filename} ({size_mb:.1f} MB)", flush=True)
+        
+        print("✅ Downloaded pre-built hash files from GitHub", flush=True)
+        return True
+        
+    except Exception as e:
+        print(f"  GitHub download failed: {e}, will rebuild from Scryfall", flush=True)
+        return False
 
 
 def fetch_bulk_metadata():
@@ -169,6 +217,17 @@ def update_index(force=False):
         return True
     
     print(f"Update needed: {reason}", flush=True)
+    
+    # Try fast path: download from GitHub release
+    if download_from_github_release():
+        # Cache metadata to avoid re-downloading
+        bulk_meta = fetch_bulk_metadata()
+        with open(METADATA_FILE, "w") as f:
+            json.dump(bulk_meta, f)
+        return True
+    
+    # Slow path: rebuild from Scryfall
+    print("\nRebuilding index from Scryfall bulk data...", flush=True)
     
     # Fetch bulk metadata
     bulk_meta = fetch_bulk_metadata()
