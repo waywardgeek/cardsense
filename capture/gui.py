@@ -237,12 +237,21 @@ class Detector:
 
             self._set_status("Watching... right-click a card")
             self.speaker.speak("CardSense ready")
+            frame_num = 0
             while self.running:
                 shot = np.array(sct.grab(mon))[:, :, :3]
+                frame_num += 1
 
                 x, y, w, h = card_box
                 crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                 hit = self.idx.identify(crop)
+
+                # Periodic debug: log every 20 frames (~1s)
+                if frame_num % 20 == 0:
+                    if hit:
+                        print(f"[POLL] frame={frame_num} match={hit[0]['name']} d={hit[1]} m={hit[2]} last={last_name}", flush=True)
+                    else:
+                        print(f"[POLL] frame={frame_num} no match, last={last_name} no_card={no_card_count}", flush=True)
 
                 if hit:
                     meta, dist, margin = hit
