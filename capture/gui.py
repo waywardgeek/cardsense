@@ -225,7 +225,7 @@ class Detector:
                     hit = self.idx.identify(crop)
                     if hit:
                         meta, dist, margin = hit
-                        if best_hit is None or margin > best_hit[2]:
+                        if best_hit is None or margin > best_hit[0][2]:
                             best_hit = (hit, (x, y, w, h))
 
                 # Sticky location: if diff didn't find the card, try the
