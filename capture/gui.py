@@ -250,6 +250,7 @@ class Detector:
 
                     # Twiddle to refine the box on first successful match
                     if not calibrated:
+                        self.speaker.speak(f"Calibrating on {name}")
                         print(f"[CALIBRATE] first match: {name} d={dist} m={margin}, twiddling...", flush=True)
                         debug = shot.copy()
                         cv2.rectangle(debug, (x, y), (x+w, y+h), (0, 255, 0), 3)
@@ -268,14 +269,18 @@ class Detector:
                     no_card_count = 0
                     if name != last_name:
                         last_name = name
+                        text = describe(meta)
                         print(f"[DETECT] {name} d={dist} m={margin} box={card_box}", flush=True)
+                        print(f"[SPEAK] {text[:80]}", flush=True)
                         self._set_status(f"🃏 {name}  (d={dist} m={margin})")
-                        self.speaker.schedule_speak(describe(meta))
+                        self.speaker.speak(text)
                 else:
                     no_card_count += 1
                     if no_card_count >= NO_CARD_FRAMES and last_name is not None:
                         last_name = None
                         self._set_status("Watching...")
+
+                time.sleep(0.05)  # ~20 fps, don't starve other threads
 
         self._set_status("Stopped")
 
