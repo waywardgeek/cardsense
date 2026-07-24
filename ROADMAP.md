@@ -48,7 +48,7 @@
 
 ### macOS Installer (.app bundle)
 - [ ] PyInstaller or py2app to bundle Python + dependencies
-- [ ] Include hash index files (11MB + 15MB) or auto-download on first run
+- [ ] **Bundle hash index files (11MB + 15MB)** → instant startup, no download
 - [ ] Code-sign the .app (prevents macOS Gatekeeper warnings)
 - [ ] DMG installer with drag-to-Applications
 - [ ] Accessibility: VoiceOver-friendly installer UI
@@ -57,7 +57,7 @@
 ### Windows Installer (.exe + installer)
 - [ ] PyInstaller to bundle Python + dependencies
 - [ ] NSIS or Inno Setup installer (silent install option for screen readers)
-- [ ] Include hash index or auto-download
+- [ ] **Bundle hash index files** → instant startup, no download
 - [ ] Code-sign the .exe (prevents Windows SmartScreen warnings)
 - [ ] Start Menu shortcuts
 - [ ] Accessibility: NVDA/JAWS-friendly installer
