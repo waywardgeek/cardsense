@@ -46,7 +46,14 @@ DUAL_BYTES = 64               # 32 (full) + 32 (art)
 
 _POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(1).astype(np.uint16)
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Detect if running from PyInstaller bundle
+import sys
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Running from PyInstaller bundle - data files are in _MEIPASS/hashindex/data
+    DATA_DIR = os.path.join(sys._MEIPASS, "hashindex", "data")
+else:
+    # Running from source
+    DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
 def _phash256(gray):
