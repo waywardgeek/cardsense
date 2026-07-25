@@ -99,7 +99,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico' if IS_WINDOWS else 'icon.icns',  # Optional: add icons later
 )
 
 coll = COLLECT(
@@ -118,7 +117,7 @@ if IS_MACOS:
     app = BUNDLE(
         coll,
         name='cardsense.app',
-        icon='icon.icns',  # Optional: add icon later
+        icon=None,  # Optional: add icon later
         bundle_identifier='com.coderhapsody.cardsense',
         info_plist={
             'CFBundleName': 'CardSense',
