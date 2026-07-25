@@ -169,19 +169,37 @@ class CardIndex:
             return result, top_dist, margin
         
         # pHash failed or low confidence - try OCR fallback
-        # BUT only if pHash found *something* card-like (prevents false positives on noise)
-        if ocr_fallback and HAS_OCR and top_dist <= 300:  # Must be vaguely card-shaped
-            card_name = ocr_card_name(gray)
-            if card_name:
-                # Quality checks to prevent false positives
-                # 1. Minimum length (card names are at least 3 characters)
-                # 2. Must look like a card name (mostly letters, not random text)
-                if len(card_name) >= 3 and sum(c.isalpha() for c in card_name) >= 3:
-                    card_meta = query_scryfall(card_name)
-                    if card_meta:
-                        card_meta['ocr_fallback'] = True
-                        # Return with synthetic dist/margin to indicate OCR was used
-                        return card_meta, 0, 999
+        # Guard 1: pHash distance must be reasonable (not random noise)
+        if not (ocr_fallback and HAS_OCR and top_dist <= 200):  # Tightened from 300
+            return None
+        
+        # Guard 2: Aspect ratio must be card-like (0.65-0.80)
+        h, w = gray.shape
+        aspect = w / h
+        if not (0.65 <= aspect <= 0.80):
+            return None
+        
+        # Try OCR extraction
+        card_name = ocr_card_name(gray)
+        if not card_name:
+            return None
+        
+        # Guard 3: OCR text must look like a real card name
+        # - At least 5 characters (e.g., "Loki")
+        # - At least 4 letters (filters "d=0 m=999" style text)
+        # - No more than 2 consecutive spaces (filters garbled multi-line OCR)
+        if len(card_name) < 5 or sum(c.isalpha() for c in card_name) < 4:
+            return None
+        if "  " in card_name:  # Multiple consecutive spaces = garbled
+            return None
+        
+        # Query Scryfall
+        card_meta = query_scryfall(card_name)
+        if card_meta:
+            card_meta['ocr_fallback'] = True
+            card_meta['ocr_text'] = card_name  # Save what we extracted
+            # Return with synthetic dist/margin to indicate OCR was used
+            return card_meta, 0, 999
         
         # Both pHash and OCR failed
         return None
