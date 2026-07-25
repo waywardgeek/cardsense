@@ -100,8 +100,8 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    codesign_identity='Developer ID Application: Bill Cox (B2SUY7SU9A)',
+    entitlements_file='entitlements.plist',
     icon='icon.ico' if IS_WINDOWS else 'icon.icns',
 )
 
@@ -130,5 +130,7 @@ if IS_MACOS:
             'CFBundleVersion': '0.2.0',
             'LSMinimumSystemVersion': '10.13',  # macOS High Sierra
             'NSHighResolutionCapable': True,
+            'NSScreenCaptureUsageDescription': 'CardSense needs screen recording permission to identify Magic: The Gathering Arena cards and read them aloud for accessibility.',
+            'NSMicrophoneUsageDescription': 'CardSense does not use the microphone. This permission request is a side effect of requesting screen recording access.',
         },
     )
