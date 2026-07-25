@@ -1,5 +1,14 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+
+# macOS
 .DS_Store
+
+# Data files (too large for git)
 hashindex/data/
+
+# Build artifacts
+build/
+dist/
