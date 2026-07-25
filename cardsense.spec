@@ -126,8 +126,8 @@ if IS_MACOS:
         info_plist={
             'CFBundleName': 'CardSense',
             'CFBundleDisplayName': 'CardSense',
-            'CFBundleShortVersionString': '0.2.0',
-            'CFBundleVersion': '0.2.0',
+            'CFBundleShortVersionString': '0.2.1',
+            'CFBundleVersion': '0.2.1',
             'LSMinimumSystemVersion': '10.13',  # macOS High Sierra
             'NSHighResolutionCapable': True,
             'NSScreenCaptureUsageDescription': 'CardSense needs screen recording permission to identify Magic: The Gathering Arena cards and read them aloud for accessibility.',
