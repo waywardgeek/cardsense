@@ -255,10 +255,10 @@ def download_and_hash(cards, verbose=True, parallel=True):
 
 
 def update_index(force=False, parallel=True):
-    """Main update workflow.
+    """Main update workflow with incremental updates.
     
     Args:
-        force: Force update even if current
+        force: Force full rebuild even if current
         parallel: Use parallel downloads (default: True, ~8x faster)
     """
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -279,15 +279,42 @@ def update_index(force=False, parallel=True):
             json.dump(bulk_meta, f)
         return True
     
-    # Slow path: rebuild from Scryfall
-    if force:
-        print("\nForce rebuild requested, skipping GitHub download...", flush=True)
-    print("\nRebuilding index from Scryfall bulk data...", flush=True)
+    # Paths
+    index_path = os.path.join(DATA_DIR, "phash_index.npz")
+    meta_path = os.path.join(DATA_DIR, "phash_meta.json")
     
-    # Fetch bulk metadata
+    # Load existing index if available (for incremental update)
+    existing_ids = set()
+    existing_bits = None
+    existing_ids_array = None
+    existing_meta = []
+    
+    if os.path.exists(index_path) and os.path.exists(meta_path) and not force:
+        try:
+            print("Loading existing index for incremental update...", flush=True)
+            with np.load(index_path) as data:
+                existing_bits = data['bits']
+                existing_ids_array = data['ids']
+                existing_ids = set(existing_ids_array)
+            with open(meta_path) as f:
+                existing_meta = json.load(f)
+            print(f"  Found {len(existing_ids)} existing cards", flush=True)
+        except Exception as e:
+            print(f"  Failed to load existing index: {e}, doing full rebuild", flush=True)
+            existing_ids = set()
+            existing_bits = None
+    
+    # Fetch bulk metadata and download
     bulk_meta = fetch_bulk_metadata()
     download_url = bulk_meta["download_uri"]
     updated_at = bulk_meta["updated_at"]
+    
+    if force:
+        print("\nForce rebuild requested, processing all cards...", flush=True)
+    elif existing_ids:
+        print(f"\nIncremental update from Scryfall (only new/changed cards)...", flush=True)
+    else:
+        print(f"\nFull rebuild from Scryfall bulk data...", flush=True)
     
     print(f"Downloading bulk data from {download_url}", flush=True)
     print(f"  Updated: {updated_at}", flush=True)
@@ -296,31 +323,58 @@ def update_index(force=False, parallel=True):
     # Download bulk JSON
     resp = requests.get(download_url, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
-    cards = resp.json()
+    all_cards = resp.json()
     
-    print(f"Loaded {len(cards)} card records", flush=True)
+    print(f"Loaded {len(all_cards)} card records from Scryfall", flush=True)
+    
+    # Filter to only new cards if doing incremental update
+    if existing_ids and not force:
+        new_cards = [c for c in all_cards if c.get("id") not in existing_ids]
+        print(f"  {len(new_cards)} new cards to process (skipping {len(all_cards) - len(new_cards)} existing)", flush=True)
+        cards_to_process = new_cards
+    else:
+        cards_to_process = all_cards
+    
+    # If no new cards, we're done
+    if len(cards_to_process) == 0:
+        print("✅ No new cards to process", flush=True)
+        # Still update metadata timestamp
+        with open(METADATA_FILE, "w") as f:
+            json.dump(bulk_meta, f)
+        return True
     
     # Download images on-the-fly and hash (with parallel downloads)
-    bits, ids, meta = download_and_hash(cards, parallel=parallel)
+    new_bits, new_ids, new_meta = download_and_hash(cards_to_process, parallel=parallel)
     
-    if len(bits) == 0:
+    if len(new_bits) == 0:
         print("ERROR: No cards successfully hashed", flush=True)
         return False
     
-    # Save index files
-    index_path = os.path.join(DATA_DIR, "phash_index.npz")
-    meta_path = os.path.join(DATA_DIR, "phash_meta.json")
+    # Merge with existing index if doing incremental update
+    if existing_bits is not None and not force:
+        print(f"Merging {len(new_bits)} new cards with {len(existing_bits)} existing...", flush=True)
+        final_bits = np.vstack([existing_bits, new_bits])
+        final_ids = np.concatenate([existing_ids_array, new_ids])
+        final_meta = existing_meta + new_meta
+    else:
+        final_bits = new_bits
+        final_ids = new_ids
+        final_meta = new_meta
     
-    print(f"Saving index with {len(bits)} cards...", flush=True)
-    np.savez(index_path, bits=bits, ids=ids)
+    # Save merged index
+    print(f"Saving index with {len(final_bits)} total cards...", flush=True)
+    np.savez(index_path, bits=final_bits, ids=final_ids)
     with open(meta_path, "w") as f:
-        json.dump(meta, f)
+        json.dump(final_meta, f)
     
     # Cache bulk metadata for future checks
     with open(METADATA_FILE, "w") as f:
         json.dump(bulk_meta, f)
     
-    print(f"✅ Index updated: {len(bits)} cards in phash_index.npz ({bits.nbytes / (1024*1024):.1f} MB)", flush=True)
+    if existing_bits is not None and not force:
+        print(f"✅ Incremental update complete: added {len(new_bits)} cards, total now {len(final_bits)} cards", flush=True)
+    else:
+        print(f"✅ Index built: {len(final_bits)} cards in phash_index.npz ({final_bits.nbytes / (1024*1024):.1f} MB)", flush=True)
     return True
 
 

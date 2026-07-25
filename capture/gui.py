@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 # Version
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hashindex"))
 from phash import CardIndex, DATA_DIR  # noqa: E402
@@ -390,32 +390,50 @@ class Detector:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            error_msg = f"❌ CRASH: {type(e).__name__}: {e}"
             print(f"[ERROR] Detector crashed: {e}", flush=True)
-            self._set_status(f"ERROR: {e}")
+            self._set_status(error_msg)
 
     def _loop_inner(self):
         try:
             import mss
         except ImportError:
-            self._set_status("ERROR: pip install mss")
+            self._set_status("❌ ERROR: pip install mss")
             return
 
         if self.idx is None:
             # Auto-update check on first load
             if HAS_UPDATER:
                 try:
+                    self._set_status("🔍 Checking for hash index updates...")
                     need_update, reason = needs_update(force=False)
                     if need_update:
-                        self._set_status(f"Updating index: {reason}")
+                        self._set_status(f"⬇️ Downloading: {reason}")
                         print(f"[UPDATE] {reason}, starting auto-update...", flush=True)
                         update_index(force=False)
+                        self._set_status("✅ Download complete")
                         print("[UPDATE] Complete", flush=True)
+                    else:
+                        print(f"[UPDATE] Hash index is current", flush=True)
                 except Exception as e:
+                    error_msg = f"⚠️ Update failed: {e}"
                     print(f"[UPDATE] Failed: {e}, continuing with existing index", flush=True)
+                    self._set_status(error_msg)
+                    time.sleep(2)  # Show error briefly
             
-            self._set_status("Loading index...")
-            self.idx = CardIndex()
-            self._set_status(f"Index loaded: {len(self.idx)} cards")
+            self._set_status("📚 Loading card index...")
+            try:
+                self.idx = CardIndex()
+                self._set_status(f"✅ Loaded {len(self.idx):,} cards")
+                time.sleep(1)  # Show success briefly
+            except FileNotFoundError as e:
+                self._set_status(f"❌ ERROR: Hash files not found. Check DATA_DIR: {e}")
+                print(f"[ERROR] Hash files missing: {e}", flush=True)
+                return
+            except Exception as e:
+                self._set_status(f"❌ ERROR loading index: {e}")
+                print(f"[ERROR] Failed to load CardIndex: {e}", flush=True)
+                return
 
         NO_CARD_FRAMES = 10
 
@@ -428,12 +446,28 @@ class Detector:
             mon = sct.monitors[1]
             H, W = mon["height"], mon["width"]
 
+            # Test screen capture permission by checking if we can actually capture
+            self._set_status("🔐 Testing screen recording permission...")
+            try:
+                test_shot = np.array(sct.grab(mon))[:, :, :3]
+                # If screen capture is blocked, we get all-black or near-black pixels
+                if test_shot.max() < 10:
+                    self._set_status("❌ PERMISSION DENIED: Enable Screen Recording in System Settings → Privacy & Security")
+                    print("[ERROR] Screen recording permission denied (all-black capture)", flush=True)
+                    print("[FIX] System Settings → Privacy & Security → Screen Recording → Enable 'cardsense'", flush=True)
+                    return
+                print(f"[INIT] Screen capture OK (pixel range: {test_shot.min()}-{test_shot.max()})", flush=True)
+            except Exception as e:
+                self._set_status(f"❌ Screen capture failed: {e}")
+                print(f"[ERROR] Screen capture test failed: {e}", flush=True)
+                return
+
             # Load calibration (saved or default, auto-scaled to current screen)
             x, y, w, h, calibrated = load_calibration(W, H)
             card_box = (x, y, w, h)
             print(f"[INIT] screen={W}×{H} box=({x},{y},{w},{h}) calibrated={calibrated}", flush=True)
 
-            self._set_status("Watching... right-click a card")
+            self._set_status("👀 Watching... right-click a card to identify")
             self.speaker.speak("CardSense ready")
             frame_num = 0
             while self.running:
@@ -457,6 +491,7 @@ class Detector:
                     # Twiddle to refine the box on first successful match
                     if not calibrated:
                         print(f"[CALIBRATE] first match: {name} d={dist} m={margin}, twiddling...", flush=True)
+                        self._set_status("🎯 Auto-calibrating detection area...")
                         self.speaker.speak("Calibrating")  # Short message, completes before twiddle
                         time.sleep(0.3)  # Let "Calibrating" start before twiddle begins
                         
@@ -504,11 +539,11 @@ class Detector:
                     no_card_count += 1
                     if no_card_count >= NO_CARD_FRAMES and last_name is not None:
                         last_name = None
-                        self._set_status("Watching...")
+                        self._set_status("👀 Watching... right-click a card to identify")
 
                 time.sleep(0.05)  # ~20 fps, don't starve other threads
 
-        self._set_status("Stopped")
+        self._set_status("⏹️ Stopped")
 
     @staticmethod
     def _twiddle(shot, box, idx):
@@ -576,7 +611,7 @@ def build_gui(debug=False):
     root.resizable(False, False)
 
     # Status label
-    status_var = tk.StringVar(value="Press Start to begin")
+    status_var = tk.StringVar(value="⏸️ Press Start to begin watching")
     status_lbl = tk.Label(root, textvariable=status_var, font=("Helvetica", 14),
                           wraplength=460, justify="left", anchor="w")
     status_lbl.pack(padx=10, pady=(15, 5), fill="x")
@@ -635,7 +670,7 @@ def build_gui(debug=False):
         detector.stop()
         start_btn.config(state="normal")
         stop_btn.config(state="disabled")
-        set_status("Stopped")
+        set_status("⏹️ Stopped - Press Start to resume")
 
     start_btn = tk.Button(btn_frame, text="▶  Start", command=_start,
                           font=("Helvetica", 13), width=10)
