@@ -342,7 +342,21 @@ class Detector:
                 crop = cv2.cvtColor(shot[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                 hit = self.idx.identify(crop)
 
-                # Debug: save crops when match should succeed but doesn't
+                # Debug: save crops for both matches and failures
+                if self.debug and hit:
+                    meta, dist, margin = hit
+                    name = meta["name"]
+                    # Sanitize name for filename
+                    safe_name = name.replace(' ', '_').replace('/', '_').replace(',', '').replace("'", '')
+                    ocr_flag = "_OCR" if meta.get('ocr_fallback', False) else ""
+                    debug_path = f"/tmp/cardsense_match_{frame_num}_{safe_name}_d{dist}_m{margin}{ocr_flag}.png"
+                    cv2.imwrite(debug_path, crop)
+                    if meta.get('ocr_fallback', False):
+                        ocr_text = meta.get('ocr_text', 'unknown')
+                        print(f"[DEBUG] OCR Match: {name} from '{ocr_text}' → {debug_path}", flush=True)
+                    else:
+                        print(f"[DEBUG] pHash Match: {name} d={dist} m={margin} → {debug_path}", flush=True)
+                
                 if self.debug and not hit and no_card_count < 3:  # Card was recently present, likely a match failure
                     debug_path = f"/tmp/cardsense_nomatch_{frame_num}.png"
                     cv2.imwrite(debug_path, crop)
