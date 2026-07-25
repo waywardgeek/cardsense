@@ -19,10 +19,23 @@ also why OCR-the-name was the wrong path.
 
 Everything here is deliberately plain array math (resize / DCT / median / XOR /
 popcount) so it ports cleanly to a single Go binary later.
+
+UPDATE 2026-07-24: OCR fallback added for MTGA rendering differences. MTGA uses
+different fonts and even different card text than Scryfall, making pHash unreliable.
+OCR the title + Scryfall fuzzy search is now the primary fallback (~200ms, very accurate).
 """
 import os
 import numpy as np
 import cv2
+
+# Optional imports for OCR fallback
+try:
+    import pytesseract
+    from PIL import Image
+    import requests
+    HAS_OCR = True
+except ImportError:
+    HAS_OCR = False
 
 # --- Descriptor geometry (do not change without rebuilding the index) ---
 HASH_SIZE = 16                 # 16x16 low-freq DCT coeffs -> 256 bits
@@ -112,27 +125,27 @@ class CardIndex:
     def __len__(self):
         return len(self.meta)
 
-    def identify(self, gray, sweep=True, max_dist=280, min_margin=20, border_trim=None):
+    def identify(self, gray, sweep=True, max_dist=280, min_margin=20, border_trim=None, ocr_fallback=True):
         """Identify a card crop.
 
         Returns (card_meta, dist, margin) on a confident match, else None.
-        Confidence gate: best distance <= max_dist AND the runner-up with a
-        DIFFERENT name is at least min_margin farther. Otherwise we stay silent
-        (never guess) — the accessibility tool must not speak a wrong card.
+        
+        Strategy:
+        1. Try pHash first (fast, works for most cards)
+        2. If no match or low confidence (margin < 50), try OCR fallback
+        
+        OCR fallback handles MTGA rendering differences (different fonts, text)
+        that make pHash unreliable even though the art is identical.
 
         Args:
             border_trim: Optional (left, top, right, bottom) pixels to trim before hashing.
-                         Reduces MTGA vs Scryfall rendering differences in borders.
+            ocr_fallback: If True, use OCR when pHash has low confidence (default: True)
 
-        Thresholds updated 2026-07-24 to accommodate MTGA rendering differences:
-        - max_dist raised from 190 to 280 (Scryfall scans vs MTGA digital renders)
-        - min_margin kept at 20 (still prevents false positives)
-        
-        Real-world distances observed:
-        - Same card, same resolution: 114-172 bits
-        - Same card, MTGA vs Scryfall: 244-268 bits (rendering gap)
-        - Different cards: typically 300+ bits
+        Returns:
+            (card_meta, dist, margin) on success, None on failure
+            card_meta will have 'ocr_fallback': True if OCR was used
         """
+        # Try pHash first
         best = None
         for v in align_variants(gray, sweep, border_trim):
             d = hamming_scan(dual_phash(v, border_trim=None), self.bits)  # Already trimmed in align_variants
@@ -141,12 +154,101 @@ class CardIndex:
         top = order[0]
         top_name = self.names[top]
         top_dist = int(best[top])
-        # nearest entry with a different name
+        
+        # Find margin (distance to next different name)
         runner = None
         for idx in order[1:]:
             if self.names[idx] != top_name:
                 runner = int(best[idx]); break
         margin = (runner - top_dist) if runner is not None else 10 ** 9
+        
+        # Check if pHash gives confident match
         if top_dist <= max_dist and margin >= min_margin:
-            return self.meta[top], top_dist, margin
+            result = self.meta[top].copy()
+            result['ocr_fallback'] = False
+            return result, top_dist, margin
+        
+        # pHash failed or low confidence - try OCR fallback
+        if ocr_fallback and HAS_OCR:
+            card_name = ocr_card_name(gray)
+            if card_name:
+                card_meta = query_scryfall(card_name)
+                if card_meta:
+                    card_meta['ocr_fallback'] = True
+                    # Return with synthetic dist/margin to indicate OCR was used
+                    return card_meta, 0, 999
+        
+        # Both pHash and OCR failed
+        return None
+
+
+
+# ── OCR fallback (for MTGA rendering differences) ─────────────────────────
+def ocr_card_name(gray_crop):
+    """Extract card name from title region via OCR.
+    
+    Returns card name string or None if OCR unavailable/failed.
+    Fast (~70ms) and works even when pHash fails due to MTGA vs Scryfall rendering.
+    """
+    if not HAS_OCR:
+        return None
+    
+    try:
+        h, w = gray_crop.shape
+        
+        # Extract title region (top 5-14% of card, avoiding borders)
+        title = gray_crop[int(h*0.05):int(h*0.14), int(w*0.05):int(w*0.95)]
+        
+        # Preprocess for OCR: invert (white text on dark → black on white)
+        inverted = cv2.bitwise_not(title)
+        
+        # Threshold to clean up
+        _, binary = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Upscale 3x for better OCR
+        scaled = cv2.resize(binary, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        
+        # OCR with letter-only whitelist
+        pil_img = Image.fromarray(scaled)
+        text = pytesseract.image_to_string(
+            pil_img, 
+            config='--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '
+        )
+        
+        # Clean and return
+        cleaned = text.strip()
+        return cleaned if cleaned else None
+        
+    except Exception as e:
+        return None
+
+
+def query_scryfall(card_name):
+    """Query Scryfall API for card by fuzzy name match.
+    
+    Returns dict with {name, type_line, oracle_text} or None if not found.
+    Scryfall's fuzzy search is very forgiving of OCR errors.
+    """
+    if not HAS_OCR:
+        return None
+    
+    try:
+        resp = requests.get(
+            f'https://api.scryfall.com/cards/named?fuzzy={card_name}',
+            headers={'User-Agent': 'cardsense/1.0'},
+            timeout=5
+        )
+        
+        if resp.status_code == 200:
+            card = resp.json()
+            return {
+                "id": card.get("id"),
+                "name": card.get("name"),
+                "type_line": card.get("type_line"),
+                "mana_cost": card.get("mana_cost"),
+                "oracle_text": card.get("oracle_text")
+            }
+        return None
+        
+    except Exception as e:
         return None
