@@ -43,8 +43,18 @@ def _phash256(gray):
     return np.packbits((d > np.median(d)).flatten())
 
 
-def dual_phash(gray):
-    """gray HxW uint8 (a card image/crop) -> packed 64-byte full++art pHash."""
+def dual_phash(gray, border_trim=None):
+    """gray HxW uint8 (a card image/crop) -> packed 64-byte full++art pHash.
+    
+    Args:
+        border_trim: Optional (left, top, right, bottom) pixels to trim before hashing.
+                     Removes border artifacts that differ between MTGA and Scryfall.
+    """
+    if border_trim:
+        left, top, right, bottom = border_trim
+        h, w = gray.shape
+        gray = gray[top:h-bottom, left:w-right]
+    
     cg = cv2.resize(gray, (CW, CH), interpolation=cv2.INTER_AREA)
     y0, y1, x0, x1 = ART_BOX
     art = cg[int(y0 * CH):int(y1 * CH), int(x0 * CW):int(x1 * CW)]
@@ -56,18 +66,34 @@ def hamming_scan(query, bits):
     return _POPCOUNT[np.bitwise_xor(bits, query[None, :])].sum(1)
 
 
-def align_variants(gray, sweep=True):
-    """Yield the crop plus a couple of inward-cropped variants to absorb
-    border/hover-glow misalignment. pHash is scale-normalized but sensitive to
-    extra border pixels, so we take the best (min) distance over these."""
-    yield gray
+def align_variants(gray, sweep=True, border_trim=None):
+    """Yield the crop plus inward-cropped variants to absorb border misalignment.
+    
+    Args:
+        border_trim: Optional (left, top, right, bottom) to trim before hashing
+    """
+    if border_trim:
+        left, top, right, bottom = border_trim
+        h, w = gray.shape
+        trimmed = gray[top:h-bottom, left:w-right]
+        yield trimmed
+    else:
+        yield gray
+    
     if not sweep:
         return
+    
     h, w = gray.shape[:2]
     for dz in (0.03, 0.06):
         m = int(min(h, w) * dz)
         if m > 0 and h - 2 * m > 10 and w - 2 * m > 10:
-            yield gray[m:h - m, m:w - m]
+            cropped = gray[m:h - m, m:w - m]
+            if border_trim:
+                left, top, right, bottom = border_trim
+                hc, wc = cropped.shape
+                cropped = cropped[top:hc-bottom, left:wc-right]
+            yield cropped
+
 
 
 class CardIndex:
@@ -86,13 +112,17 @@ class CardIndex:
     def __len__(self):
         return len(self.meta)
 
-    def identify(self, gray, sweep=True, max_dist=280, min_margin=20):
+    def identify(self, gray, sweep=True, max_dist=280, min_margin=20, border_trim=None):
         """Identify a card crop.
 
         Returns (card_meta, dist, margin) on a confident match, else None.
         Confidence gate: best distance <= max_dist AND the runner-up with a
         DIFFERENT name is at least min_margin farther. Otherwise we stay silent
         (never guess) — the accessibility tool must not speak a wrong card.
+
+        Args:
+            border_trim: Optional (left, top, right, bottom) pixels to trim before hashing.
+                         Reduces MTGA vs Scryfall rendering differences in borders.
 
         Thresholds updated 2026-07-24 to accommodate MTGA rendering differences:
         - max_dist raised from 190 to 280 (Scryfall scans vs MTGA digital renders)
@@ -104,8 +134,8 @@ class CardIndex:
         - Different cards: typically 300+ bits
         """
         best = None
-        for v in align_variants(gray, sweep):
-            d = hamming_scan(dual_phash(v), self.bits)
+        for v in align_variants(gray, sweep, border_trim):
+            d = hamming_scan(dual_phash(v, border_trim=None), self.bits)  # Already trimmed in align_variants
             best = d if best is None else np.minimum(best, d)
         order = np.argsort(best)
         top = order[0]
