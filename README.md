@@ -112,7 +112,7 @@ Issues and pull requests welcome! This tool was built by someone with visual imp
 
 ## License
 
-MIT License - free for personal and commercial use.
+Apache 2.0 License - free for personal and commercial use.
 
 ## Links
 

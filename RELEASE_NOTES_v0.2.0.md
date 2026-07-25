@@ -78,7 +78,7 @@ See [BUILD.md](https://github.com/waywardgeek/cardsense/blob/main/BUILD.md) for 
 
 ## 📝 License
 
-MIT License - free for personal and commercial use.
+Apache 2.0 License - free for personal and commercial use.
 
 ## 🙏 Credits
 
