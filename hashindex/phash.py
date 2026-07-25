@@ -169,14 +169,19 @@ class CardIndex:
             return result, top_dist, margin
         
         # pHash failed or low confidence - try OCR fallback
-        if ocr_fallback and HAS_OCR:
+        # BUT only if pHash found *something* card-like (prevents false positives on noise)
+        if ocr_fallback and HAS_OCR and top_dist <= 300:  # Must be vaguely card-shaped
             card_name = ocr_card_name(gray)
             if card_name:
-                card_meta = query_scryfall(card_name)
-                if card_meta:
-                    card_meta['ocr_fallback'] = True
-                    # Return with synthetic dist/margin to indicate OCR was used
-                    return card_meta, 0, 999
+                # Quality checks to prevent false positives
+                # 1. Minimum length (card names are at least 3 characters)
+                # 2. Must look like a card name (mostly letters, not random text)
+                if len(card_name) >= 3 and sum(c.isalpha() for c in card_name) >= 3:
+                    card_meta = query_scryfall(card_name)
+                    if card_meta:
+                        card_meta['ocr_fallback'] = True
+                        # Return with synthetic dist/margin to indicate OCR was used
+                        return card_meta, 0, 999
         
         # Both pHash and OCR failed
         return None
