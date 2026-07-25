@@ -86,7 +86,7 @@ class CardIndex:
     def __len__(self):
         return len(self.meta)
 
-    def identify(self, gray, sweep=True, max_dist=190, min_margin=20):
+    def identify(self, gray, sweep=True, max_dist=280, min_margin=20):
         """Identify a card crop.
 
         Returns (card_meta, dist, margin) on a confident match, else None.
@@ -94,8 +94,14 @@ class CardIndex:
         DIFFERENT name is at least min_margin farther. Otherwise we stay silent
         (never guess) — the accessibility tool must not speak a wrong card.
 
-        Defaults max_dist/min_margin are conservative starting points in the
-        512-bit space; calibration tightens them per-display.
+        Thresholds updated 2026-07-24 to accommodate MTGA rendering differences:
+        - max_dist raised from 190 to 280 (Scryfall scans vs MTGA digital renders)
+        - min_margin kept at 20 (still prevents false positives)
+        
+        Real-world distances observed:
+        - Same card, same resolution: 114-172 bits
+        - Same card, MTGA vs Scryfall: 244-268 bits (rendering gap)
+        - Different cards: typically 300+ bits
         """
         best = None
         for v in align_variants(gray, sweep):

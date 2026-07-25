@@ -188,13 +188,27 @@ def download_and_hash(cards, verbose=True, parallel=True):
     t0 = time.time()
     
     if parallel:
-        # Parallel processing
+        # Parallel processing with real-time progress
         n_workers = min(cpu_count(), 8)  # Cap at 8 to avoid overwhelming Scryfall
         print(f"  Using {n_workers} parallel workers", flush=True)
         
         with Pool(n_workers) as pool:
             args = [(card, temp_dir) for card in cards]
-            results = pool.map(_download_and_hash_card, args)
+            # Use imap_unordered for real-time progress (yields results as they complete)
+            results_iter = pool.imap_unordered(_download_and_hash_card, args, chunksize=10)
+            
+            # Collect results with progress reporting
+            results = []
+            for i, (result, status) in enumerate(results_iter, 1):
+                results.append((result, status))
+                
+                # Progress update every 100 cards
+                if i % 100 == 0:
+                    elapsed = time.time() - t0
+                    rate = i / elapsed
+                    eta = (len(cards) - i) / rate if rate > 0 else 0
+                    pct = i / len(cards) * 100
+                    print(f"  {i}/{len(cards)} ({pct:.1f}%) — {elapsed:.0f}s elapsed, {rate:.1f}/s, ETA {eta:.0f}s", flush=True)
     else:
         # Serial processing (old path)
         results = [_download_and_hash_card((card, temp_dir)) for card in cards]
