@@ -21,6 +21,9 @@ from tkinter import ttk
 import cv2
 import numpy as np
 
+# Version
+VERSION = "0.2.1"
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hashindex"))
 from phash import CardIndex, DATA_DIR  # noqa: E402
 
@@ -568,7 +571,7 @@ def build_gui(debug=False):
     detector = Detector(speaker, debug=debug)
 
     root = tk.Tk()
-    root.title("CardSense")
+    root.title(f"CardSense v{VERSION}")
     root.geometry("480x280")
     root.resizable(False, False)
 
