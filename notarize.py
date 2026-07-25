@@ -28,6 +28,13 @@ APP_PATH = DIST_DIR / 'cardsense.app'
 ZIP_PATH = DIST_DIR / 'cardsense.zip'
 DMG_PATH = DIST_DIR / 'cardsense.dmg'
 
+# Use venv Python if available
+VENV_PYTHON = ROOT / 'venv' / 'bin' / 'python3'
+if VENV_PYTHON.exists():
+    PYTHON = str(VENV_PYTHON)
+else:
+    PYTHON = sys.executable
+
 # Apple Developer info
 APPLE_ID = "waywardgeek@gmail.com"  # Your Apple ID
 TEAM_ID = "B2SUY7SU9A"  # From your Developer ID certificate
@@ -45,7 +52,7 @@ def run(cmd, check=True):
 def build_app():
     """Build signed .app with PyInstaller."""
     print("\n🔨 Building signed .app...")
-    result = run([sys.executable, 'build.py', '--clean'])
+    result = run([PYTHON, 'build.py', '--clean'])
     if not APP_PATH.exists():
         print(f"❌ Build failed: {APP_PATH} not found")
         sys.exit(1)
@@ -117,6 +124,7 @@ def create_dmg():
 def verify_prerequisites():
     """Check that prerequisites are met."""
     print("🔍 Checking prerequisites...")
+    print(f"   Using Python: {PYTHON}")
     
     # Check for Developer ID certificate
     result = run([
