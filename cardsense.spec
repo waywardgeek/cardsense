@@ -48,6 +48,8 @@ hiddenimports = [
     'numpy',
     'pytesseract',
     'requests',
+    'phash',  # hashindex module
+    'update_index',  # hashindex module
 ]
 
 if IS_MACOS:
@@ -67,7 +69,7 @@ block_cipher = None
 
 a = Analysis(
     ['capture/gui.py'],
-    pathex=[],
+    pathex=['hashindex'],  # Include hashindex directory for phash module
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
