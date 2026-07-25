@@ -38,7 +38,7 @@ else:
 # Apple Developer info
 APPLE_ID = "waywardgeek@gmail.com"  # Your Apple ID
 TEAM_ID = "B2SUY7SU9A"  # From your Developer ID certificate
-APP_PASSWORD_KEYCHAIN_ITEM = "@keychain:AC_PASSWORD"  # Store app-specific password here
+KEYCHAIN_PROFILE = "CardSense"  # Keychain profile name (stored via notarytool store-credentials)
 
 def run(cmd, check=True):
     """Run command and return output."""
@@ -74,9 +74,7 @@ def submit_for_notarization():
     
     result = run([
         'xcrun', 'notarytool', 'submit', str(ZIP_PATH),
-        '--apple-id', APPLE_ID,
-        '--team-id', TEAM_ID,
-        '--password', APP_PASSWORD_KEYCHAIN_ITEM,
+        '--keychain-profile', KEYCHAIN_PROFILE,
         '--wait',
         '--output-format', 'json',
     ])
@@ -89,7 +87,7 @@ def submit_for_notarization():
         return data.get('id')
     else:
         print(f"❌ Notarization failed: {data.get('status')}")
-        print(f"   Check logs with: xcrun notarytool log {data.get('id')} --apple-id {APPLE_ID} --team-id {TEAM_ID} --password {APP_PASSWORD_KEYCHAIN_ITEM}")
+        print(f"   Check logs with: xcrun notarytool log {data.get('id')} --keychain-profile {KEYCHAIN_PROFILE}")
         sys.exit(1)
 
 def staple_ticket():
@@ -142,7 +140,7 @@ def verify_prerequisites():
     print("   1. Go to appleid.apple.com")
     print("   2. Sign in → Security → App-Specific Passwords → Generate")
     print("   3. Store in Keychain:")
-    print(f"      xcrun notarytool store-credentials AC_PASSWORD \\")
+    print(f"      xcrun notarytool store-credentials CardSense \\")
     print(f"        --apple-id {APPLE_ID} \\")
     print(f"        --team-id {TEAM_ID}")
     print("   (You only need to do this once)")
