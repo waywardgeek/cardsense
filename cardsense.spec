@@ -46,6 +46,7 @@ hiddenimports = [
     'tkinter',
     'cv2',
     'numpy',
+    'mss',  # screen capture (imported in try/except)
     'pytesseract',
     'requests',
     'phash',  # hashindex module
