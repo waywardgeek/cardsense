@@ -8,3 +8,6 @@ requests>=2.31.0
 # Platform-specific TTS
 pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'
 pyttsx3>=2.90; sys_platform == 'win32'
+
+# Build tools (optional, for creating installers)
+pyinstaller>=6.0.0

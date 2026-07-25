@@ -31,33 +31,43 @@
 
 ### Cross-platform TTS
 - [x] macOS: NSSpeechSynthesizer with NSRunLoop (working)
-- [ ] Windows: `win32com.client` + SAPI 5 voices
-  - Known good voices: IVONA, RealSpeak, Microsoft Cortana
-  - Reference: `cr/docs/windows-tts-voice-loading.md` has voice-loading quirks
-  - Speed: test at 550 WPM (may need different rate scaling)
-- [ ] Test fallback: `pyttsx3` (cross-platform but may be slower)
+- [x] Windows: `pyttsx3` + SAPI 5 (implemented, async thread, 450 WPM default)
+  - Uses async command queue pattern (matches macOS architecture)
+  - Prefers Zira/Hazel voices, falls back to first available
+- [ ] Windows testing: verify voice quality, adjust rate if needed
+- [ ] Test fallback: Linux/other platforms (currently uses pyttsx3)
 
 ### Platform Detection
-- [ ] Detect OS (macOS/Windows/Linux)
-- [ ] Load platform-specific TTS backend
+- [x] Detect OS (macOS/Windows/Linux) — using platform.system()
+- [x] Load platform-specific TTS backend — get_speaker() factory in gui.py
 - [ ] Platform-specific default box positions (MTGA window size/position varies)
 
 ## Phase 3: Installers for Low-Vision Users
 
 **Goal**: One-click install, zero terminal commands, works immediately.
 
+### Installer Infrastructure
+- [x] PyInstaller spec file (cardsense.spec) — supports macOS .app and Windows .exe
+- [x] Build script (build.py) — automated build with hash file bundling
+- [x] Build documentation (BUILD.md) — step-by-step instructions
+- [x] Bundle hash files (~26MB) → instant startup, no download
+- [ ] Test macOS .app build
+- [ ] Test Windows .exe build
+
 ### macOS Installer (.app bundle)
-- [ ] PyInstaller or py2app to bundle Python + dependencies
-- [ ] **Bundle hash index files (11MB + 15MB)** → instant startup, no download
+- [x] PyInstaller spec to bundle Python + dependencies
+- [x] **Bundle hash index files (11MB + 15MB)** → instant startup, no download
+- [ ] Test build: `python build.py` → dist/cardsense.app
 - [ ] Code-sign the .app (prevents macOS Gatekeeper warnings)
 - [ ] DMG installer with drag-to-Applications
 - [ ] Accessibility: VoiceOver-friendly installer UI
 - [ ] Auto-update mechanism (check GitHub releases, download new .app)
 
 ### Windows Installer (.exe + installer)
-- [ ] PyInstaller to bundle Python + dependencies
+- [x] PyInstaller spec to bundle Python + dependencies
+- [x] **Bundle hash index files** → instant startup, no download
+- [ ] Test build: `python build.py` → dist/cardsense/cardsense.exe
 - [ ] NSIS or Inno Setup installer (silent install option for screen readers)
-- [ ] **Bundle hash index files** → instant startup, no download
 - [ ] Code-sign the .exe (prevents Windows SmartScreen warnings)
 - [ ] Start Menu shortcuts
 - [ ] Accessibility: NVDA/JAWS-friendly installer
