@@ -183,8 +183,8 @@ def describe(meta):
     return ". ".join(parts)
 
 
-# ── TTS (NSSpeechSynthesizer on dedicated thread with NSRunLoop) ───────────
-class Speaker:
+# ── TTS (cross-platform Speaker abstraction) ──────────────────────────────
+class MacOSSpeaker:
     """NSSpeechSynthesizer on its own thread with a running NSRunLoop."""
 
     def __init__(self):
@@ -253,6 +253,105 @@ class Speaker:
 
     def schedule_speak(self, text):
         self.speak(text)
+
+
+class WindowsSpeaker:
+    """pyttsx3 TTS for Windows (uses SAPI 5) with async thread."""
+
+    def __init__(self):
+        import queue
+        self._queue = queue.Queue()
+        self._engine = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(5.0)  # wait for engine init
+
+    def _run_loop(self):
+        """Dedicated thread: create engine + pump commands forever."""
+        import pyttsx3
+        self._engine = pyttsx3.init()
+        # Map 550 WPM (macOS rate) to Windows rate
+        # pyttsx3 default is ~200 WPM, max is typically ~450 WPM
+        self._engine.setProperty('rate', 450)  # Max out Windows TTS
+        self.rate = 550  # Logical rate for UI display
+        self.voice = None
+        
+        # Try to find a good default voice
+        voices = self._engine.getProperty('voices')
+        if voices:
+            # Prefer female voices (often clearer), or just use first
+            for v in voices:
+                if 'zira' in v.name.lower() or 'hazel' in v.name.lower():
+                    self._engine.setProperty('voice', v.id)
+                    self.voice = v.name
+                    break
+            if not self.voice:
+                self._engine.setProperty('voice', voices[0].id)
+                self.voice = voices[0].name
+        
+        self._ready.set()
+
+        while True:
+            # Drain command queue
+            while not self._queue.empty():
+                cmd, args = self._queue.get_nowait()
+                if cmd == "speak":
+                    self._engine.stop()
+                    self._engine.say(args)
+                    self._engine.runAndWait()
+                elif cmd == "cancel":
+                    self._engine.stop()
+                elif cmd == "rate":
+                    # Map logical rate to pyttsx3 rate (cap at 450)
+                    pyttsx_rate = min(450, int(args * 0.82))  # 550 -> 450
+                    self._engine.setProperty('rate', pyttsx_rate)
+                elif cmd == "voice":
+                    self._set_voice_inner(args)
+            # Brief sleep to avoid CPU spin
+            time.sleep(0.05)
+
+    def _set_voice_inner(self, voice_name):
+        voices = self._engine.getProperty('voices')
+        key = voice_name.split('(')[0].strip().lower()
+        for v in voices:
+            if key in v.name.lower():
+                self._engine.setProperty('voice', v.id)
+                self.voice = v.name
+                return
+
+    def speak(self, text):
+        self._queue.put(("speak", text))
+
+    def schedule_speak(self, text):
+        self.speak(text)
+
+    def cancel(self):
+        self._queue.put(("cancel", None))
+
+    def set_rate(self, rate):
+        self.rate = rate
+        self._queue.put(("rate", rate))
+
+    def set_voice(self, voice_name):
+        self.voice = voice_name
+        self._queue.put(("voice", voice_name))
+
+    def is_speaking(self):
+        return self._engine.isBusy() if self._engine else False
+
+
+def get_speaker():
+    """Factory: return platform-specific Speaker instance."""
+    system = platform.system()
+    if system == 'Darwin':
+        return MacOSSpeaker()
+    elif system == 'Windows':
+        return WindowsSpeaker()
+    else:
+        # Linux fallback - could add espeak support later
+        print(f"WARNING: No TTS support for {system}, using WindowsSpeaker as fallback")
+        return WindowsSpeaker()
 
 
 # ── Detector loop (runs in background thread) ─────────────────────────────
@@ -465,7 +564,7 @@ VOICES = [
 
 
 def build_gui(debug=False):
-    speaker = Speaker()
+    speaker = get_speaker()
     detector = Detector(speaker, debug=debug)
 
     root = tk.Tk()
